@@ -1,5 +1,6 @@
 import argparse, os, sys, datetime, glob, importlib, csv
 import numpy as np
+import math
 import time
 import torch
 
@@ -135,7 +136,7 @@ def get_parser(**parser_kwargs):
         nargs="?",
         const=True,
         default=True,
-        help="scale base-lr by num_devices * num_nodes * batch_size * n_accumulate",
+        help="scale base-lr by sqrt(n_accumulate * num_devices * num_nodes)",
     )
 
     parser.add_argument(
@@ -765,11 +766,15 @@ if __name__ == "__main__":
         # can't tell us if we need to do this scaling or not
         # https://github.com/Lightning-AI/lightning/discussions/3706#discussioncomment-238302
         if opt.scale_lr:
-            effective_devices = trainer.num_devices * trainer.num_nodes
-            model.learning_rate = accumulate_grad_batches * effective_devices * bs * base_lr
+            # the sqrt scaling method is actually correct since `batch_size` is
+            # per device and `accumulate_grad_batches` scales that up; if you use
+            # linear scaling, you're basically doing the work of N*M batches just
+            # to learn at the rate of N batches
+            batch_scalar = accumulate_grad_batches * trainer.num_devices * trainer.num_nodes
+            model.learning_rate = math.sqrt(batch_scalar) * base_lr
             print(
-                "Setting learning rate to {:.2e} = {} (accumulate_grad_batches) * {} (num_devices) * {} (num_nodes) * {} (batchsize) * {:.2e} (base_lr)".format(
-                    model.learning_rate, accumulate_grad_batches, trainer.num_devices, trainer.num_nodes, bs, base_lr))
+                "Setting learning rate to {:.2e} = sqrt({} accumulate_grad_batches * {} devices * {} nodes) * {:.2e} base_learning_rate".format(
+                    model.learning_rate, accumulate_grad_batches, trainer.num_devices, trainer.num_nodes, base_lr))
         else:
             model.learning_rate = base_lr
             print("++++ NOT USING LR SCALING ++++")
