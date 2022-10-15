@@ -1,3 +1,4 @@
+from typing import Any, Literal, TypeAlias, Union
 import argparse, os, sys, datetime, glob, importlib, csv
 import numpy as np
 import math
@@ -9,7 +10,7 @@ import pytorch_lightning as pl
 import pytorch_lightning.loggers as pl_loggers
 
 from packaging import version
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import random_split, DataLoader, Dataset, Subset
 from functools import partial
 from PIL import Image
@@ -113,7 +114,6 @@ def get_parser(**parser_kwargs):
         "-s",
         "--seed",
         type=int,
-        default=23,
         help="seed for seed_everything",
     )
     parser.add_argument(
@@ -534,6 +534,64 @@ if __name__ == "__main__":
     #           params:
     #               key: value
 
+    # Copy from one config path to another when the first is unset and the second exists.
+    CfgDefFrom: TypeAlias = tuple[Literal["default_from"], str, str]
+    # When the second path exists, always copy the value to the first path.
+    CfgSetFrom: TypeAlias = tuple[Literal["set_from"], str, str]
+    # Set a config path to a given value if it is unset; the value must exist.
+    CfgDefAs: TypeAlias = tuple[Literal["default_as"], str, Any]
+    # Always set a config path to a given value; the value must exist.
+    CfgSetAs: TypeAlias = tuple[Literal["set_as"], str, Any]
+    # Ensures a config path no longer exists.
+    CfgDrop: TypeAlias = tuple[Literal["drop"], str]
+    CfgOps: TypeAlias = Union[CfgDefFrom, CfgSetFrom, CfgDefAs, CfgSetAs]
+
+    def operate_on_config(config: DictConfig, *args: CfgOps):
+        """
+        Performs some common operations on an OmegaConf `DictConfig`.  These
+        are performed in the order given.  See the `CfgOps` type for operations
+        that can be performed.
+
+        The meaning of a value "existing" is its key must exist (when a path)
+        and/or the value must not be `None`.  This allows `kwargs` defaults
+        to work properly.
+        """
+
+        from omegaconf._utils import split_key
+
+        # A reference to use as a default, to detect actually missing keys.
+        NOT_EXISTS = {}
+
+        # Why does this dumb library not have a built-in for this?
+        def is_set(path: str):
+            return OmegaConf.select(config, path, default=NOT_EXISTS) is not NOT_EXISTS
+
+        def try_set(path: str, val: Any):
+            if val is None: return
+            OmegaConf.update(config, path, val)
+
+        for op in args:
+            if op[0] == "default_from":
+                if is_set(op[1]): continue
+                try_set(op[1], OmegaConf.select(config, op[2], default=None))
+            elif op[0] == "set_from":
+                try_set(op[1], OmegaConf.select(config, op[2], default=None))
+            elif op[0] == "default_as":
+                if is_set(op[1]): continue
+                try_set(op[1], op[2])
+            elif op[0] == "set_as":
+                try_set(op[1], op[2])
+            elif op[0] == "drop":
+                keys = split_key(op[1])
+                last_key = keys.pop()
+                keys = "[" + "][".join(keys) + "]"
+                sub_config = OmegaConf.select(config, keys, default=None)
+                if sub_config is None: continue
+                sub_config.pop(last_key, None)
+            else:
+                raise TypeError(f"Unknown config operation: {op}")
+        return config
+
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
     # add cwd for convenience and to make classes in this file available when
@@ -591,35 +649,55 @@ if __name__ == "__main__":
 
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
-    seed_everything(opt.seed)
 
     try:
         # init and save configs
         configs = [OmegaConf.load(cfg) for cfg in opt.base]
         cli = OmegaConf.from_dotlist(unknown)
         config = OmegaConf.merge(*configs, cli)
+
+        pp = "model.params.personalization_config.params"
+        tp = "data.params.train.params"
+        vp = "data.params.validation.params"
+
+        operate_on_config(config,
+            # if given a seed from CLI, always use it
+            ("set_as", "seed", opt.seed),
+            # otherwise, default to a static value
+            ("default_as", "seed", 23),
+            # this can come from the `--resume` config, but we have already
+            # located the correct `last.ckpt`, so get rid of it to prevent
+            # the deprecation warning
+            ("drop", "lightning.trainer.resume_from_checkpoint"),
+            # merge trainer cli with config
+            *[("set_as", f"lightning.trainer[{k}]", getattr(opt, k)) for k in nondefault_trainer_args(opt)],
+            # apply custom cli for model
+            ("set_as", f"{pp}.embedding_manager_ckpt", opt.embedding_manager_ckpt),
+            ("set_as", f"{pp}.placeholder_strings", [opt.placeholder_string] if opt.placeholder_string else None),
+            ("default_as", f"{pp}.initializer_words", [opt.init_word] if opt.init_word else None),
+            ("set_as", f"{pp}.initializer_words[0]", opt.init_word),
+            # handle data personalization templates
+            ("default_from", f"{tp}.templates", f"{pp}.templates"),
+            ("default_from", f"{vp}.templates", f"{pp}.templates"),
+            ("drop", f"{pp}.templates"),
+            # and the data personalization dual templates
+            ("default_from", f"{tp}.dual_templates", f"{pp}.dual_templates"),
+            ("default_from", f"{vp}.dual_templates", f"{pp}.dual_templates"),
+            ("drop", f"{pp}.dual_templates"),
+            # and copy the personalization `per_image_tokens` value to both datasets
+            ("set_from", f"{tp}.per_image_tokens", f"{pp}.per_image_tokens"),
+            ("set_from", f"{vp}.per_image_tokens", f"{pp}.per_image_tokens"),
+            # set the `data_root` from the cli
+            ("set_as", f"{tp}.data_root", opt.data_root),
+            ("set_as", f"{vp}.data_root", opt.data_root),
+        )
+
+        seed_everything(OmegaConf.select(config, "seed"))
+
         lightning_config = config.pop("lightning", OmegaConf.create())
-        # merge trainer cli with config
-        trainer_config = lightning_config.get("trainer", OmegaConf.create())
-        for k in nondefault_trainer_args(opt):
-            trainer_config[k] = getattr(opt, k)
-        # this can come from the `--resume` config, but we have already
-        # located the correct `last.ckpt`, so get rid of it to prevent
-        # the deprecation warning
-        trainer_config.pop("resume_from_checkpoint", None)
-        trainer_opt = argparse.Namespace(**trainer_config)
-        lightning_config.trainer = trainer_config
+        trainer_opt = argparse.Namespace(**OmegaConf.select(lightning_config, "trainer", default={}))
 
         # model
-
-        # config.model.params.personalization_config.params.init_word = opt.init_word
-        config.model.params.personalization_config.params.embedding_manager_ckpt = opt.embedding_manager_ckpt
-        if opt.placeholder_string:
-            config.model.params.personalization_config.params.placeholder_strings = [opt.placeholder_string]
-
-        if opt.init_word:
-            config.model.params.personalization_config.params.initializer_words[0] = opt.init_word
-
         if opt.actual_resume:
             model = load_model_from_config(config, opt.actual_resume)
         else:
@@ -752,8 +830,6 @@ if __name__ == "__main__":
         print(f"Strategy: {trainer.strategy.__class__.__name__}")
 
         # data
-        config.data.params.train.params.data_root = opt.data_root
-        config.data.params.validation.params.data_root = opt.data_root
         data = instantiate_from_config(config.data)
 
         # configure learning rate
