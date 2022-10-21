@@ -3,7 +3,7 @@ from torch import Tensor, nn
 
 from ldm.util import default
 from ldm.modules.embedding_shuffler import get_shuffler
-from ldm.data.personalized import per_img_token_list
+from ldm.data.personalized import extra_token_list
 from transformers import CLIPTokenizer
 from functools import partial
 
@@ -69,7 +69,7 @@ class EmbeddingManager(nn.Module):
             token_dim = 1280
 
         if per_image_tokens:
-            placeholder_strings.extend(per_img_token_list)
+            placeholder_strings.extend(extra_token_list)
 
         for idx, placeholder_string in enumerate(placeholder_strings):
             

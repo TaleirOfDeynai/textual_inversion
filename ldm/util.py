@@ -1,3 +1,4 @@
+from typing import Callable, Optional, Union, TypeVar, TypeGuard
 import importlib
 
 import torch
@@ -12,6 +13,9 @@ from queue import Queue
 
 from inspect import isfunction
 from PIL import Image, ImageDraw, ImageFont
+
+
+T = TypeVar("T")
 
 
 def log_txt_as_img(wh, xc, size=10):
@@ -50,11 +54,11 @@ def isimage(x):
     return (len(x.shape) == 4) and (x.shape[1] == 3 or x.shape[1] == 1)
 
 
-def exists(x):
+def exists(x: Optional[T]) -> TypeGuard[T]:
     return x is not None
 
 
-def default(val, d):
+def default(val: Optional[T], d: Union[T, Callable[[], T]]) -> T:
     if exists(val):
         return val
     return d() if isfunction(d) else d
