@@ -1,56 +1,52 @@
 import os
+import random
 import numpy as np
-import PIL
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-import random
+from ldm.data.personalized import per_img_token_list
 
 imagenet_templates_small = [
-    'a painting in the style of {}',
-    'a rendering in the style of {}',
-    'a cropped painting in the style of {}',
-    'the painting in the style of {}',
-    'a clean painting in the style of {}',
-    'a dirty painting in the style of {}',
-    'a dark painting in the style of {}',
-    'a picture in the style of {}',
-    'a cool painting in the style of {}',
-    'a close-up painting in the style of {}',
-    'a bright painting in the style of {}',
-    'a cropped painting in the style of {}',
-    'a good painting in the style of {}',
-    'a close-up painting in the style of {}',
-    'a rendition in the style of {}',
-    'a nice painting in the style of {}',
-    'a small painting in the style of {}',
-    'a weird painting in the style of {}',
-    'a large painting in the style of {}',
+    'a painting in the style of {0}',
+    'a rendering in the style of {0}',
+    'a cropped painting in the style of {0}',
+    'the painting in the style of {0}',
+    'a clean painting in the style of {0}',
+    'a dirty painting in the style of {0}',
+    'a dark painting in the style of {0}',
+    'a picture in the style of {0}',
+    'a cool painting in the style of {0}',
+    'a close-up painting in the style of {0}',
+    'a bright painting in the style of {0}',
+    'a cropped painting in the style of {0}',
+    'a good painting in the style of {0}',
+    'a close-up painting in the style of {0}',
+    'a rendition in the style of {0}',
+    'a nice painting in the style of {0}',
+    'a small painting in the style of {0}',
+    'a weird painting in the style of {0}',
+    'a large painting in the style of {0}',
 ]
 
 imagenet_dual_templates_small = [
-    'a painting in the style of {} with {}',
-    'a rendering in the style of {} with {}',
-    'a cropped painting in the style of {} with {}',
-    'the painting in the style of {} with {}',
-    'a clean painting in the style of {} with {}',
-    'a dirty painting in the style of {} with {}',
-    'a dark painting in the style of {} with {}',
-    'a cool painting in the style of {} with {}',
-    'a close-up painting in the style of {} with {}',
-    'a bright painting in the style of {} with {}',
-    'a cropped painting in the style of {} with {}',
-    'a good painting in the style of {} with {}',
-    'a painting of one {} in the style of {}',
-    'a nice painting in the style of {} with {}',
-    'a small painting in the style of {} with {}',
-    'a weird painting in the style of {} with {}',
-    'a large painting in the style of {} with {}',
-]
-
-per_img_token_list = [
-    'א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ז', 'ח', 'ט', 'י', 'כ', 'ל', 'מ', 'נ', 'ס', 'ע', 'פ', 'צ', 'ק', 'ר', 'ש', 'ת',
+    'a painting in the style of {0} with {1}',
+    'a rendering in the style of {0} with {1}',
+    'a cropped painting in the style of {0} with {1}',
+    'the painting in the style of {0} with {1}',
+    'a clean painting in the style of {0} with {1}',
+    'a dirty painting in the style of {0} with {1}',
+    'a dark painting in the style of {0} with {1}',
+    'a cool painting in the style of {0} with {1}',
+    'a close-up painting in the style of {0} with {1}',
+    'a bright painting in the style of {0} with {1}',
+    'a cropped painting in the style of {0} with {1}',
+    'a good painting in the style of {0} with {1}',
+    'a painting of one {1} in the style of {0}',
+    'a nice painting in the style of {0} with {1}',
+    'a small painting in the style of {0} with {1}',
+    'a weird painting in the style of {0} with {1}',
+    'a large painting in the style of {0} with {1}',
 ]
 
 class PersonalizedBase(Dataset):
@@ -64,6 +60,9 @@ class PersonalizedBase(Dataset):
                  placeholder_token="*",
                  per_image_tokens=False,
                  center_crop=False,
+                 mixing_prob=0.25,
+                 templates=None,
+                 dual_templates=None,
                  ):
 
         self.data_root = data_root
@@ -75,9 +74,12 @@ class PersonalizedBase(Dataset):
         self._length = self.num_images 
 
         self.placeholder_token = placeholder_token
+        self.templates = imagenet_templates_small if templates is None else templates
+        self.dual_templates = imagenet_dual_templates_small if dual_templates is None else dual_templates
 
         self.per_image_tokens = per_image_tokens
         self.center_crop = center_crop
+        self.mixing_prob = mixing_prob
 
         if per_image_tokens:
             assert self.num_images < len(per_img_token_list), f"Can't use per-image tokens when the training set contains more than {len(per_img_token_list)} tokens. To enable larger sets, add more tokens to 'per_img_token_list'."
@@ -86,10 +88,10 @@ class PersonalizedBase(Dataset):
             self._length = self.num_images * repeats
 
         self.size = size
-        self.interpolation = {"linear": PIL.Image.LINEAR,
-                              "bilinear": PIL.Image.BILINEAR,
-                              "bicubic": PIL.Image.BICUBIC,
-                              "lanczos": PIL.Image.LANCZOS,
+        self.interpolation = {"linear": Image.LINEAR,
+                              "bilinear": Image.BILINEAR,
+                              "bicubic": Image.BICUBIC,
+                              "lanczos": Image.LANCZOS,
                               }[interpolation]
         self.flip = transforms.RandomHorizontalFlip(p=flip_p)
 
@@ -102,11 +104,11 @@ class PersonalizedBase(Dataset):
 
         if not image.mode == "RGB":
             image = image.convert("RGB")
-
-        if self.per_image_tokens and np.random.uniform() < 0.25:
-            text = random.choice(imagenet_dual_templates_small).format(self.placeholder_token, per_img_token_list[i % self.num_images])
-        else:
-            text = random.choice(imagenet_templates_small).format(self.placeholder_token)
+        
+        extra_token = per_img_token_list[i % self.num_images % len(per_img_token_list)]
+        using_dual = self.per_image_tokens and np.random.uniform() < self.mixing_prob
+        templates = self.templates if not using_dual else self.dual_templates
+        text = random.choice(templates).format(self.placeholder_token, extra_token)
             
         example["caption"] = text
 

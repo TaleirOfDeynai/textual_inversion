@@ -1,128 +1,130 @@
 import os
+import random
 import numpy as np
-import PIL
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-import random
+# The interpolation placeholder `{0}` maps to the primary
+# token for the subject being trained (usually "*") and
+# `{1}` will map to the extra per-image token.
 
 imagenet_templates_smallest = [
-    'a photo of a {}',
+    'a photo of a {0}',
 ]
 
 imagenet_templates_small = [
-    'a photo of a {}',
-    'a rendering of a {}',
-    'a cropped photo of the {}',
-    'the photo of a {}',
-    'a photo of a clean {}',
-    'a photo of a dirty {}',
-    'a dark photo of the {}',
-    'a photo of my {}',
-    'a photo of the cool {}',
-    'a close-up photo of a {}',
-    'a bright photo of the {}',
-    'a cropped photo of a {}',
-    'a photo of the {}',
-    'a good photo of the {}',
-    'a photo of one {}',
-    'a close-up photo of the {}',
-    'a rendition of the {}',
-    'a photo of the clean {}',
-    'a rendition of a {}',
-    'a photo of a nice {}',
-    'a good photo of a {}',
-    'a photo of the nice {}',
-    'a photo of the small {}',
-    'a photo of the weird {}',
-    'a photo of the large {}',
-    'a photo of a cool {}',
-    'a photo of a small {}',
-    'an illustration of a {}',
-    'a rendering of a {}',
-    'a cropped photo of the {}',
-    'the photo of a {}',
-    'an illustration of a clean {}',
-    'an illustration of a dirty {}',
-    'a dark photo of the {}',
-    'an illustration of my {}',
-    'an illustration of the cool {}',
-    'a close-up photo of a {}',
-    'a bright photo of the {}',
-    'a cropped photo of a {}',
-    'an illustration of the {}',
-    'a good photo of the {}',
-    'an illustration of one {}',
-    'a close-up photo of the {}',
-    'a rendition of the {}',
-    'an illustration of the clean {}',
-    'a rendition of a {}',
-    'an illustration of a nice {}',
-    'a good photo of a {}',
-    'an illustration of the nice {}',
-    'an illustration of the small {}',
-    'an illustration of the weird {}',
-    'an illustration of the large {}',
-    'an illustration of a cool {}',
-    'an illustration of a small {}',
-    'a depiction of a {}',
-    'a rendering of a {}',
-    'a cropped photo of the {}',
-    'the photo of a {}',
-    'a depiction of a clean {}',
-    'a depiction of a dirty {}',
-    'a dark photo of the {}',
-    'a depiction of my {}',
-    'a depiction of the cool {}',
-    'a close-up photo of a {}',
-    'a bright photo of the {}',
-    'a cropped photo of a {}',
-    'a depiction of the {}',
-    'a good photo of the {}',
-    'a depiction of one {}',
-    'a close-up photo of the {}',
-    'a rendition of the {}',
-    'a depiction of the clean {}',
-    'a rendition of a {}',
-    'a depiction of a nice {}',
-    'a good photo of a {}',
-    'a depiction of the nice {}',
-    'a depiction of the small {}',
-    'a depiction of the weird {}',
-    'a depiction of the large {}',
-    'a depiction of a cool {}',
-    'a depiction of a small {}',
+    'a photo of a {0}',
+    'a rendering of a {0}',
+    'a cropped photo of the {0}',
+    'the photo of a {0}',
+    'a photo of a clean {0}',
+    'a photo of a dirty {0}',
+    'a dark photo of the {0}',
+    'a photo of my {0}',
+    'a photo of the cool {0}',
+    'a close-up photo of a {0}',
+    'a bright photo of the {0}',
+    'a cropped photo of a {0}',
+    'a photo of the {0}',
+    'a good photo of the {0}',
+    'a photo of one {0}',
+    'a close-up photo of the {0}',
+    'a rendition of the {0}',
+    'a photo of the clean {0}',
+    'a rendition of a {0}',
+    'a photo of a nice {0}',
+    'a good photo of a {0}',
+    'a photo of the nice {0}',
+    'a photo of the small {0}',
+    'a photo of the weird {0}',
+    'a photo of the large {0}',
+    'a photo of a cool {0}',
+    'a photo of a small {0}',
+    'an illustration of a {0}',
+    'a rendering of a {0}',
+    'a cropped photo of the {0}',
+    'the photo of a {0}',
+    'an illustration of a clean {0}',
+    'an illustration of a dirty {0}',
+    'a dark photo of the {0}',
+    'an illustration of my {0}',
+    'an illustration of the cool {0}',
+    'a close-up photo of a {0}',
+    'a bright photo of the {0}',
+    'a cropped photo of a {0}',
+    'an illustration of the {0}',
+    'a good photo of the {0}',
+    'an illustration of one {0}',
+    'a close-up photo of the {0}',
+    'a rendition of the {0}',
+    'an illustration of the clean {0}',
+    'a rendition of a {0}',
+    'an illustration of a nice {0}',
+    'a good photo of a {0}',
+    'an illustration of the nice {0}',
+    'an illustration of the small {0}',
+    'an illustration of the weird {0}',
+    'an illustration of the large {0}',
+    'an illustration of a cool {0}',
+    'an illustration of a small {0}',
+    'a depiction of a {0}',
+    'a rendering of a {0}',
+    'a cropped photo of the {0}',
+    'the photo of a {0}',
+    'a depiction of a clean {0}',
+    'a depiction of a dirty {0}',
+    'a dark photo of the {0}',
+    'a depiction of my {0}',
+    'a depiction of the cool {0}',
+    'a close-up photo of a {0}',
+    'a bright photo of the {0}',
+    'a cropped photo of a {0}',
+    'a depiction of the {0}',
+    'a good photo of the {0}',
+    'a depiction of one {0}',
+    'a close-up photo of the {0}',
+    'a rendition of the {0}',
+    'a depiction of the clean {0}',
+    'a rendition of a {0}',
+    'a depiction of a nice {0}',
+    'a good photo of a {0}',
+    'a depiction of the nice {0}',
+    'a depiction of the small {0}',
+    'a depiction of the weird {0}',
+    'a depiction of the large {0}',
+    'a depiction of a cool {0}',
+    'a depiction of a small {0}',
 ]
 
 imagenet_dual_templates_small = [
-    'a photo of a {} with {}',
-    'a rendering of a {} with {}',
-    'a cropped photo of the {} with {}',
-    'the photo of a {} with {}',
-    'a photo of a clean {} with {}',
-    'a photo of a dirty {} with {}',
-    'a dark photo of the {} with {}',
-    'a photo of my {} with {}',
-    'a photo of the cool {} with {}',
-    'a close-up photo of a {} with {}',
-    'a bright photo of the {} with {}',
-    'a cropped photo of a {} with {}',
-    'a photo of the {} with {}',
-    'a good photo of the {} with {}',
-    'a photo of one {} with {}',
-    'a close-up photo of the {} with {}',
-    'a rendition of the {} with {}',
-    'a photo of the clean {} with {}',
-    'a rendition of a {} with {}',
-    'a photo of a nice {} with {}',
-    'a good photo of a {} with {}',
-    'a photo of the nice {} with {}',
-    'a photo of the small {} with {}',
-    'a photo of the weird {} with {}',
-    'a photo of the large {} with {}',
-    'a photo of a cool {} with {}',
-    'a photo of a small {} with {}',
+    'a photo of a {0} with {1}',
+    'a rendering of a {0} with {1}',
+    'a cropped photo of the {0} with {1}',
+    'the photo of a {0} with {1}',
+    'a photo of a clean {0} with {1}',
+    'a photo of a dirty {0} with {1}',
+    'a dark photo of the {0} with {1}',
+    'a photo of my {0} with {1}',
+    'a photo of the cool {0} with {1}',
+    'a close-up photo of a {0} with {1}',
+    'a bright photo of the {0} with {1}',
+    'a cropped photo of a {0} with {1}',
+    'a photo of the {0} with {1}',
+    'a good photo of the {0} with {1}',
+    'a photo of one {0} with {1}',
+    'a close-up photo of the {0} with {1}',
+    'a rendition of the {0} with {1}',
+    'a photo of the clean {0} with {1}',
+    'a rendition of a {0} with {1}',
+    'a photo of a nice {0} with {1}',
+    'a good photo of a {0} with {1}',
+    'a photo of the nice {0} with {1}',
+    'a photo of the small {0} with {1}',
+    'a photo of the weird {0} with {1}',
+    'a photo of the large {0} with {1}',
+    'a photo of a cool {0} with {1}',
+    'a photo of a small {0} with {1}',
 ]
 
 per_img_token_list = [
@@ -142,6 +144,8 @@ class PersonalizedBase(Dataset):
                  center_crop=False,
                  mixing_prob=0.25,
                  coarse_class_text=None,
+                 templates=None,
+                 dual_templates=None,
                  ):
 
         self.data_root = data_root
@@ -153,6 +157,8 @@ class PersonalizedBase(Dataset):
         self._length = self.num_images 
 
         self.placeholder_token = placeholder_token
+        self.templates = imagenet_templates_small if templates is None else templates
+        self.dual_templates = imagenet_dual_templates_small if dual_templates is None else dual_templates
 
         self.per_image_tokens = per_image_tokens
         self.center_crop = center_crop
@@ -167,10 +173,10 @@ class PersonalizedBase(Dataset):
             self._length = self.num_images * repeats
 
         self.size = size
-        self.interpolation = {"linear": PIL.Image.LINEAR,
-                              "bilinear": PIL.Image.BILINEAR,
-                              "bicubic": PIL.Image.BICUBIC,
-                              "lanczos": PIL.Image.LANCZOS,
+        self.interpolation = {"linear": Image.LINEAR,
+                              "bilinear": Image.BILINEAR,
+                              "bicubic": Image.BICUBIC,
+                              "lanczos": Image.LANCZOS,
                               }[interpolation]
         self.flip = transforms.RandomHorizontalFlip(p=flip_p)
 
@@ -184,14 +190,10 @@ class PersonalizedBase(Dataset):
         if not image.mode == "RGB":
             image = image.convert("RGB")
 
-        placeholder_string = self.placeholder_token
-        if self.coarse_class_text:
-            placeholder_string = f"{self.coarse_class_text} {placeholder_string}"
-
-        if self.per_image_tokens and np.random.uniform() < self.mixing_prob:
-            text = random.choice(imagenet_dual_templates_small).format(placeholder_string, per_img_token_list[i % self.num_images])
-        else:
-            text = random.choice(imagenet_templates_small).format(placeholder_string)
+        extra_token = per_img_token_list[i % self.num_images % len(per_img_token_list)]
+        using_dual = self.per_image_tokens and np.random.uniform() < self.mixing_prob
+        templates = self.templates if not using_dual else self.dual_templates
+        text = random.choice(templates).format(self.placeholder_string, extra_token)
             
         example["caption"] = text
 
@@ -212,3 +214,9 @@ class PersonalizedBase(Dataset):
         image = np.array(image).astype(np.uint8)
         example["image"] = (image / 127.5 - 1.0).astype(np.float32)
         return example
+
+    @property
+    def placeholder_string(self):
+        if self.coarse_class_text:
+            return f"{self.coarse_class_text} {self.placeholder_token}"
+        return self.placeholder_token
