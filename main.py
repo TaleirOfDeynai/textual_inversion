@@ -657,8 +657,6 @@ if __name__ == "__main__":
         config = OmegaConf.merge(*configs, cli)
 
         pp = "model.params.personalization_config.params"
-        tp = "data.params.train.params"
-        vp = "data.params.validation.params"
 
         operate_on_config(config,
             # if given a seed from CLI, always use it
@@ -676,20 +674,31 @@ if __name__ == "__main__":
             ("set_as", f"{pp}.placeholder_strings", [opt.placeholder_string] if opt.placeholder_string else None),
             ("default_as", f"{pp}.initializer_words", [opt.init_word] if opt.init_word else None),
             ("set_as", f"{pp}.initializer_words[0]", opt.init_word),
-            # handle data personalization templates
-            ("default_from", f"{tp}.templates", f"{pp}.templates"),
-            ("default_from", f"{vp}.templates", f"{pp}.templates"),
+        )
+
+        # normalize the data config
+        if OmegaConf.select(config, "data.params.train.target") is not None:
+            tp = "data.params.train.params"
+            operate_on_config(config,
+                ("default_from", f"{tp}.templates", f"{pp}.templates"),
+                ("default_from", f"{tp}.dual_templates", f"{pp}.dual_templates"),
+                ("set_from", f"{tp}.per_image_tokens", f"{pp}.per_image_tokens"),
+                ("set_as", f"{tp}.data_root", opt.data_root),
+            )
+
+        if OmegaConf.select(config, "data.params.validation.target") is not None:
+            vp = "data.params.validation.params"
+            operate_on_config(config,
+                ("default_from", f"{vp}.templates", f"{pp}.templates"),
+                ("default_from", f"{vp}.dual_templates", f"{pp}.dual_templates"),
+                ("set_from", f"{vp}.per_image_tokens", f"{pp}.per_image_tokens"),
+                ("set_as", f"{vp}.data_root", opt.data_root),
+            )
+
+        # drop the copies of the templates from the personalization config
+        operate_on_config(config,
             ("drop", f"{pp}.templates"),
-            # and the data personalization dual templates
-            ("default_from", f"{tp}.dual_templates", f"{pp}.dual_templates"),
-            ("default_from", f"{vp}.dual_templates", f"{pp}.dual_templates"),
             ("drop", f"{pp}.dual_templates"),
-            # and copy the personalization `per_image_tokens` value to both datasets
-            ("set_from", f"{tp}.per_image_tokens", f"{pp}.per_image_tokens"),
-            ("set_from", f"{vp}.per_image_tokens", f"{pp}.per_image_tokens"),
-            # set the `data_root` from the cli
-            ("set_as", f"{tp}.data_root", opt.data_root),
-            ("set_as", f"{vp}.data_root", opt.data_root),
         )
 
         seed_everything(OmegaConf.select(config, "seed"))
