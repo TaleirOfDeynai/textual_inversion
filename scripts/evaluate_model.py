@@ -13,7 +13,7 @@ from torchvision.utils import make_grid
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
-from ldm.data.personalized import PersonalizedSubject
+from ldm.data.personalized import PersonalizedBase
 from evaluation.clip_eval import LDMCLIPEvaluator
 
 def load_model_from_config(config, ckpt, verbose=False):
@@ -76,7 +76,7 @@ if __name__ == "__main__":
 
     prompt = opt.prompt
 
-    data_loader = PersonalizedSubject(data_dir=opt.data_dir, size=256, flip_p=0.0)
+    data_loader = PersonalizedBase(data_dir=opt.data_dir, size=256, flip_p=0.0)
 
     images = [torch.from_numpy(data_loader[i]["image"]).permute(2, 0, 1) for i in range(data_loader.num_images)]
     images = torch.stack(images, axis=0)

@@ -88,14 +88,14 @@ data:
     num_workers: 2
     wrap: false
     train:
-      target: ldm.data.personalized.PersonalizedSubject
+      target: ldm.data.personalized.PersonalizedBase
       params:
         size: 256
         set: train
         per_image_tokens: false
         repeats: 100
     validation:
-      target: ldm.data.personalized.PersonalizedSubject
+      target: ldm.data.personalized.PersonalizedBase
       params:
         size: 256
         set: val
