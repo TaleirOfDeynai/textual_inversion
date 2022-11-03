@@ -1,11 +1,15 @@
 from typing import Optional, Union, Sequence
+from argparse import Namespace
 
 import random
 import numpy as np
+from torch.utils.data import Dataset
+from omegaconf import DictConfig, OmegaConf
 
 from ldm.util import default
 from ldm.data.image_loader import ImageLoader, ImageData
-from torch.utils.data import Dataset
+from ldm.config import DatasetKey, ConfigInstantiable, BasicDataModule, operate_on_config
+from ldm.util import compact_dict
 
 # The interpolation placeholder `{0}` maps to the primary
 # token for the subject being trained (usually "*") and
@@ -189,9 +193,8 @@ def get_extra_tokens(tokens: Union[list[str], bool, None], count: int):
 
 
 class ClassicData(ImageData):
-    """An image with caption and used placeholders."""
+    """An image with caption."""
     caption: str
-    placeholders: list[str]
 
 
 class ClassicStyle(Dataset, Sequence):
@@ -205,7 +208,7 @@ class ClassicStyle(Dataset, Sequence):
                  mixing_prob: float=0.25,
                  **kwargs
                  ):
-        super().__init__(**kwargs)
+        super().__init__()
 
         assert multiplier > 0, "The `multiplier` argument must be greater than zero."
 
@@ -224,21 +227,20 @@ class ClassicStyle(Dataset, Sequence):
         src_data = self.images[i % len(self.images)]
 
         using_dual = len(self.per_image_tokens) > 0 and np.random.uniform() < self.mixing_prob
-        caption, placeholders = self.caption_dual(i) if using_dual else self.caption_single()
+        caption = self.caption_dual(i) if using_dual else self.caption_single()
 
-        return ClassicData(caption=caption, placeholders=placeholders, **src_data)
+        return ClassicData(caption=caption, **src_data)
 
     @property
     def placeholder_string(self):
         return self.placeholder_token
 
-    def caption_single(self) -> tuple[str, list[str]]:
+    def caption_single(self):
         assert len(self.templates) > 0, "Cannot provide a caption; `templates` is empty!"
         text = random.choice(self.templates)
-        caption = text.format(self.placeholder_string, self.placeholder_token)
-        return (caption, [self.placeholder_string])
+        return text.format(self.placeholder_string, self.placeholder_token)
 
-    def caption_dual(self, i: int) -> tuple[str, list[str]]:
+    def caption_dual(self, i: int):
         len_extra = len(self.per_image_tokens)
         # fail over to a single caption if we can't do a double
         if len_extra == 0 and len(self.templates) > 0: return self.caption_single()
@@ -246,8 +248,7 @@ class ClassicStyle(Dataset, Sequence):
         assert len(self.dual_templates) > 0, "Cannot provide a dual caption; `dual_templates` is empty!"
         extra_token = self.per_image_tokens[i % len(self.images) % len_extra]
         text = random.choice(self.dual_templates)
-        caption = text.format(self.placeholder_string, extra_token)
-        return (caption, [self.placeholder_string, extra_token])
+        return text.format(self.placeholder_string, extra_token)
 
 
 class ClassicSubject(ClassicStyle):
@@ -269,3 +270,82 @@ class ClassicSubject(ClassicStyle):
         if self.coarse_class_text:
             return f"{self.coarse_class_text} {self.placeholder_token}"
         return self.placeholder_token
+
+
+# constants for config parameter locations
+SUPPORTED_KLASSES = [
+    "ldm.data.classic.ClassicSubject",
+    "ldm.data.classic.ClassicStyle"
+]
+
+PERS_CONFIG = ConfigInstantiable(
+    path="model.params.personalization_config",
+    klasses=["ldm.modules.embedding_manager.EmbeddingManager"]
+)
+IMAGES_CONFIG = ConfigInstantiable(
+    path="data.params.images",
+    klasses=["ldm.data.image_loader.ImageLoader"]
+)
+DATA_CONFIGS: dict[DatasetKey, ConfigInstantiable] = {
+    "train": ConfigInstantiable(
+        path="data.params.train",
+        klasses=SUPPORTED_KLASSES
+    ),
+    "validation": ConfigInstantiable(
+        path="data.params.validation",
+        klasses=SUPPORTED_KLASSES
+    ),
+    "test": ConfigInstantiable(
+        path="data.params.test",
+        klasses=SUPPORTED_KLASSES
+    ),
+    "predict": ConfigInstantiable(
+        path="data.params.predict",
+        klasses=SUPPORTED_KLASSES
+    )
+}
+
+
+class ClassicDataModule(BasicDataModule):
+    def __init__(self,
+                 images: DictConfig,
+                 templates: Optional[list[str]]=None,
+                 dual_templates: Optional[list[str]]=None,
+                 **kwargs
+                ):
+        super().__init__(**kwargs)
+
+        self.extra_config_args = compact_dict({
+            "images": IMAGES_CONFIG.direct().instantiate(images),
+            "templates": templates,
+            "dual_templates": dual_templates,
+        })
+
+    def instantiate_data(self, config_key: DatasetKey):
+        return DATA_CONFIGS[config_key].direct().instantiate(
+            self.dataset_configs[config_key],
+            **self.extra_config_args
+        )
+
+    @staticmethod
+    def normalize_config(config: DictConfig, opt: Namespace):
+        pt = OmegaConf.select(config, PERS_CONFIG.target, default="")
+        assert PERS_CONFIG.supports(pt), f"Requires {PERS_CONFIG.target} to be one of: {PERS_CONFIG.klasses}"
+
+        pp = PERS_CONFIG.params
+        operate_on_config(config,
+            # apply custom cli for model
+            ("set_as", f"{pp}.embedding_manager_ckpt", opt.embedding_manager_ckpt),
+            ("set_as", f"{pp}.placeholder_strings", [opt.placeholder_string] if opt.placeholder_string else None),
+            ("default_as", f"{pp}.initializer_words", [opt.init_word] if opt.init_word else None),
+            ("set_as", f"{pp}.initializer_words[0]", opt.init_word),
+        )
+
+        # normalize the data configs; only work on expected data classes
+        for dc in DATA_CONFIGS:
+            dt = OmegaConf.select(config, dc.target, default="")
+            if not dc.supports(dt): continue
+            dp = dc.params
+            operate_on_config(config,
+                ("set_from", f"{dp}.per_image_tokens", f"{pp}.per_image_tokens")
+            )
