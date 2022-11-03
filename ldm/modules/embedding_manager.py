@@ -5,7 +5,7 @@ from torch import Tensor, nn
 
 from ldm.util import default, as_list
 from ldm.modules.embedding_shuffler import ShuffleMode, get_shuffler
-from ldm.data.personalized import extra_token_list
+from ldm.data.classic import extra_token_list
 from functools import partial
 
 DEFAULT_PLACEHOLDER_TOKEN = ["*"]

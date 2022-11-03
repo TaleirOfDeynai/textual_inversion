@@ -1,16 +1,16 @@
-import functools
 from typing import Optional
+from dataclasses import dataclass
 
 import os
 import random
 import itertools
 import numpy as np
-from dataclasses import dataclass
-
 from omegaconf import OmegaConf
-import ldm.data.personalized as dp
 
+import ldm.data.image_loader as di
+import ldm.data.classic as dc
 from ldm.util import default, partition
+from torch.utils.data import Dataset
 
 subject_conditions = [
     'a rendition',
@@ -96,17 +96,17 @@ class MetadataConf:
     templates: list[str] = []
 
 
-class ImageSrcWithMetadata(dp.ImageSrc):
+class ImageSrcWithMetadata(di.ImageSrc):
     """An image setup for processing, with metadata."""
     metadata: MetadataConf
 
 
-class ImageDataWithMetadata(dp.ImageData):
+class ImageDataWithMetadata(di.ImageData):
     """An image ready to use in the dataset, with metadata."""
     metadata: MetadataConf
 
 
-def load_image_metadata(src_data: dp.ImageSrc):
+def load_image_metadata(src_data: di.ImageSrc):
     config: MetadataConf = OmegaConf.structured(MetadataConf)
 
     try:
@@ -118,10 +118,10 @@ def load_image_metadata(src_data: dp.ImageSrc):
     return ImageSrcWithMetadata(metadata=config, **src_data)
 
 def get_quality_tokens(qualities: list[str]):
-    assert len(qualities) <= len(dp.extra_token_list), f"Loaded {len(qualities)} unique qualities, but only have {len(dp.extra_token_list)} extra tokens. Try adding more tokens to 'extra_token_list'."
+    assert len(qualities) <= len(dc.extra_token_list), f"Loaded {len(qualities)} unique qualities, but only have {len(dc.extra_token_list)} extra tokens. Try adding more tokens to 'extra_token_list'."
     result: dict[str, str] = {}
     for i, v in enumerate(qualities):
-        result[v] = dp.extra_token_list[i]
+        result[v] = dc.extra_token_list[i]
     return result
 
 def is_dual_template(template: str):
@@ -139,12 +139,12 @@ def pick_quality(qualities: list[str], mixing_prob: float, solo_count: int, dual
     return random.choice(qualities)
 
 
-class ManagedBase(dp.PersonalizedBase):
-    def __init__(self, **kwargs):
+class ManagedBase(Dataset):
+    def __init__(self, images: di.ImageLoader, **kwargs):
         super().__init__(**kwargs)
 
         # Load the per-image metadata.
-        self.images = list(map(load_image_metadata, self.images))
+        self.images = list(map(load_image_metadata, images))
 
         # Generate a list of known qualities.
         # We have a resume issue I'm not sure how to resolve.  If the user adds
@@ -163,7 +163,7 @@ class ManagedBase(dp.PersonalizedBase):
         # Does not include the metadata.
         base_data = super().__getitem__(i)
         # So lets add it in.
-        src_data = self.images[i % self.num_images]
+        src_data = self.images[i % len(self.images)]
         return ImageDataWithMetadata(metadata=src_data["metadata"], **base_data)
 
 

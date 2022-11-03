@@ -1,13 +1,11 @@
-from typing import Any, Optional, Union, TypedDict
+from typing import Optional, Union, Sequence
 
-import os
 import random
 import numpy as np
 
 from ldm.util import default
-from PIL import Image, UnidentifiedImageError
+from ldm.data.image_loader import ImageLoader, ImageData
 from torch.utils.data import Dataset
-from torchvision import transforms
 
 # The interpolation placeholder `{0}` maps to the primary
 # token for the subject being trained (usually "*") and
@@ -173,53 +171,6 @@ extra_token_list = [
     'א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ז', 'ח', 'ט', 'י', 'כ', 'ל', 'מ', 'נ', 'ס', 'ע', 'פ', 'צ', 'ק', 'ר', 'ש', 'ת',
 ]
 
-INTERPOLATIONS = {
-    "linear": Image.LINEAR,
-    "bilinear": Image.BILINEAR,
-    "bicubic": Image.BICUBIC,
-    "lanczos": Image.LANCZOS,
-}
-
-
-class ImageSrc(TypedDict):
-    """An image setup for processing."""
-    path: str
-    image: np.ndarray[Any, np.dtype[np.uint8]]
-
-
-class ImageData(TypedDict):
-    """An image ready to use in the dataset."""
-    path: str
-    image: np.ndarray[Any, np.dtype[np.float32]]
-
-
-def get_images_in(data_root: str,
-                  center_crop: bool=False,
-                  size: Optional[int]=None,
-                  interpolation: Optional[str]="bicubic"):
-    resample = INTERPOLATIONS[interpolation]
-    images: list[ImageSrc] = []
-    for file_path in os.listdir(data_root):
-        img_path = os.path.join(data_root, file_path)
-        try:
-            image = Image.open(img_path)
-            image = image.convert("RGB") if not image.mode == "RGB" else image
-            img = np.array(image, dtype=np.uint8)
-
-            if center_crop:
-                crop = min(img.shape[0], img.shape[1])
-                h, w, = img.shape[0], img.shape[1]
-                img = img[(h - crop) // 2:(h + crop) // 2, (w - crop) // 2:(w + crop) // 2]
-
-            if size is not None:
-                image = Image.fromarray(img)
-                image = image.resize((size, size), resample=resample)
-                img = np.array(image, dtype=np.uint8)
-
-            images.append(ImageSrc(path=img_path, image=img))
-        except UnidentifiedImageError:
-            continue
-    return images
 
 def as_extra_tokens(tokens: Union[list[str], bool, None]):
     if tokens is None: return extra_token_list
@@ -237,67 +188,45 @@ def get_extra_tokens(tokens: Union[list[str], bool, None], count: int):
     return tokens
 
 
-class PersonalizedBase(Dataset):
-    def __init__(self,
-                 data_root: str,
-                 size: Optional[int]=None,
-                 repeats=100,
-                 interpolation="bicubic",
-                 flip_p=0.5,
-                 set="train",
-                 center_crop=False,
-                 ):
-
-        self.data_root = data_root
-        self.images = get_images_in(data_root, center_crop, size, interpolation)
-
-        self.num_images = len(self.images)
-        self._length = self.num_images * repeats if set == "train" else self.num_images
-        self.flip = transforms.RandomHorizontalFlip(p=flip_p)
-
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, i):
-        src_data = self.images[i % self.num_images]
-
-        image = Image.fromarray(src_data["image"].copy())
-        image = self.flip(image)
-        image = np.array(image, dtype=np.uint8)
-        image = (image / 127.5 - 1.0).astype(np.float32)
-        return ImageData(path=src_data["path"], image=image)
-
-
-class PersonalizedData(ImageData):
+class ClassicData(ImageData):
     """An image with caption and used placeholders."""
     caption: str
     placeholders: list[str]
 
 
-class PersonalizedStyle(PersonalizedBase):
+class ClassicStyle(Dataset, Sequence):
     def __init__(self,
+                 images: ImageLoader,
+                 multiplier: int=100,
                  placeholder_token: str="*",
-                 per_image_tokens: Union[list[str], bool, None]=False,
-                 mixing_prob=0.25,
                  templates: Optional[list[str]]=None,
                  dual_templates: Optional[list[str]]=None,
+                 per_image_tokens: Union[list[str], bool, None]=False,
+                 mixing_prob: float=0.25,
                  **kwargs
                  ):
         super().__init__(**kwargs)
 
+        assert multiplier > 0, "The `multiplier` argument must be greater than zero."
+
+        self.images = images
+        self.multiplier = multiplier
         self.placeholder_token = placeholder_token
         self.templates = default(templates, style_templates)
         self.dual_templates = default(dual_templates, style_dual_templates)
-        self.per_image_tokens = get_extra_tokens(per_image_tokens, self.num_images)
+        self.per_image_tokens = get_extra_tokens(per_image_tokens, len(self.images))
         self.mixing_prob = mixing_prob
 
+    def __len__(self):
+        return len(self.images) * self.multiplier
+
     def __getitem__(self, i: int):
-        src_data = super().__getitem__(i)
+        src_data = self.images[i % len(self.images)]
 
         using_dual = len(self.per_image_tokens) > 0 and np.random.uniform() < self.mixing_prob
         caption, placeholders = self.caption_dual(i) if using_dual else self.caption_single()
 
-        return PersonalizedData(caption=caption, placeholders=placeholders, **src_data)
+        return ClassicData(caption=caption, placeholders=placeholders, **src_data)
 
     @property
     def placeholder_string(self):
@@ -315,13 +244,13 @@ class PersonalizedStyle(PersonalizedBase):
         if len_extra == 0 and len(self.templates) > 0: return self.caption_single()
         # in case we can't fail safely
         assert len(self.dual_templates) > 0, "Cannot provide a dual caption; `dual_templates` is empty!"
-        extra_token = self.per_image_tokens[i % self.num_images % len_extra]
+        extra_token = self.per_image_tokens[i % len(self.images) % len_extra]
         text = random.choice(self.dual_templates)
         caption = text.format(self.placeholder_string, extra_token)
         return (caption, [self.placeholder_string, extra_token])
 
 
-class PersonalizedSubject(PersonalizedStyle):
+class ClassicSubject(ClassicStyle):
     def __init__(self,
                  coarse_class_text: Optional[str]=None,
                  templates: Optional[list[str]]=None,
