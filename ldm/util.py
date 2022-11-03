@@ -1,5 +1,7 @@
-from typing import Callable, Optional, Union, TypeVar, TypeGuard
+from typing import Optional, Tuple, Union, TypeVar, TypeGuard
+from typing import Callable, Iterable, Sequence
 import importlib
+import itertools
 
 import torch
 import numpy as np
@@ -64,6 +66,12 @@ def default(val: Optional[T], d: Union[T, Callable[[], T]]) -> T:
 def as_list(val: Union[list[T], T]) -> list[T]:
     if isinstance(val, list): return val
     return [val]
+
+
+def partition(items: Sequence[T], predicate: Callable[[T], bool]) -> Tuple[Iterable[T], Iterable[T]]:
+    a, b = itertools.tee((predicate(item), item) for item in items)
+    return ((item for pred, item in a if not pred),
+            (item for pred, item in b if pred))
 
 
 def mean_flat(tensor):
