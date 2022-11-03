@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union, TypeVar, TypeGuard
+from typing import Any, Optional, Tuple, Union, TypeVar, TypeGuard
 from typing import Callable, Iterable, Sequence
 import importlib
 import itertools
@@ -18,6 +18,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 T = TypeVar("T")
+K = TypeVar("K")
+V = TypeVar("V")
 
 
 def log_txt_as_img(wh, xc, size=10):
@@ -58,13 +60,25 @@ def exists(x: Optional[T]) -> TypeGuard[T]:
     return x is not None
 
 
+def hasmethod(obj: Any, key: str):
+    """Determine if an attribute exists on an object and is callable."""
+    return hasattr(obj, key) and callable(getattr(obj, key))
+
+
 def default(val: Optional[T], d: Union[T, Callable[[], T]]) -> T:
     if exists(val): return val
     return d() if isfunction(d) else d
 
 
+def compact_dict(obj: dict[K, Optional[V]]) -> dict[K, V]:
+    """Returns a copy of `obj` with all keys mapping to `None` removed."""
+    return { k: v for k, v in obj.items() if exists(v) }
+
+
 def as_list(val: Union[list[T], T]) -> list[T]:
     if isinstance(val, list): return val
+    if isinstance(val, str): return [val]
+    if hasmethod(val, "__len__") and hasmethod(val, "__getitem__"): return [*val]
     return [val]
 
 

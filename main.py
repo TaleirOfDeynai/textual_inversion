@@ -1,5 +1,5 @@
-from typing import Any, Literal, TypeAlias, Union
-import argparse, os, sys, datetime, glob, importlib, csv
+import argparse, os, sys, datetime, glob
+from typing import Optional
 import numpy as np
 import math
 import time
@@ -11,32 +11,42 @@ import pytorch_lightning.loggers as pl_loggers
 
 from packaging import version
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import random_split, DataLoader, Dataset, Subset
-from functools import partial
 from PIL import Image
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
+from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
 
-from ldm.data.base import Txt2ImgIterableBaseDataset
-from ldm.util import instantiate_from_config
+from ldm.config import operate_on_config, ConfigInstantiable
+from ldm.util import instantiate_from_config, get_obj_from_str, hasmethod
 
-def load_model_from_config(config, ckpt, verbose=False):
-    print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    sd = pl_sd["state_dict"]
-    config.model.params.ckpt_path = ckpt
-    model = instantiate_from_config(config.model)
-    m, u = model.load_state_dict(sd, strict=False)
-    if len(m) > 0 and verbose:
-        print("missing keys:")
-        print(m)
-    if len(u) > 0 and verbose:
-        print("unexpected keys:")
-        print(u)
+# aliased for backward compatibility
+from ldm.data.personalized import PersonalizedDataModule as DataModuleFromConfig
+
+MODEL_CONFIG = ConfigInstantiable(path="model", klasses=None)
+DATA_CONFIG = ConfigInstantiable(path="data", klasses=None)
+
+def load_model_from_config(
+                           config: DictConfig,
+                           ckpt: Optional[str]=None,
+                           verbose=False
+                          ):
+    operate_on_config(config, ("set_as", f"{MODEL_CONFIG.params}.ckpt_path", ckpt))
+    model = MODEL_CONFIG.instantiate(config)
+
+    if ckpt is not None:
+        print(f"Loading model from {ckpt}")
+        pl_sd = torch.load(ckpt, map_location="cpu")
+        sd = pl_sd["state_dict"]
+        m, u = model.load_state_dict(sd, strict=False)
+        if len(m) > 0 and verbose:
+            print("missing keys:")
+            print(m)
+        if len(u) > 0 and verbose:
+            print("unexpected keys:")
+            print(u)
 
     return model
 
@@ -178,118 +188,6 @@ def nondefault_trainer_args(opt):
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args([])
     return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
-
-
-class WrappedDataset(Dataset):
-    """Wraps an arbitrary object with __len__ and __getitem__ into a pytorch dataset"""
-
-    def __init__(self, dataset):
-        self.data = dataset
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-
-def worker_init_fn(_):
-    worker_info = torch.utils.data.get_worker_info()
-
-    dataset = worker_info.dataset
-    worker_id = worker_info.id
-
-    if isinstance(dataset, Txt2ImgIterableBaseDataset):
-        split_size = dataset.num_records // worker_info.num_workers
-        # reset num_records to the true number to retain reliable length information
-        dataset.sample_ids = dataset.valid_ids[worker_id * split_size:(worker_id + 1) * split_size]
-        current_id = np.random.choice(len(np.random.get_state()[1]), 1)
-        return np.random.seed(np.random.get_state()[1][current_id] + worker_id)
-    else:
-        return np.random.seed(np.random.get_state()[1][0] + worker_id)
-
-
-class DataModuleFromConfig(pl.LightningDataModule):
-    def __init__(self, batch_size, train=None, validation=None, test=None, predict=None,
-                 wrap=False, num_workers=None, shuffle_test_loader=False, use_worker_init_fn=False,
-                 shuffle_val_dataloader=False):
-        super().__init__()
-        self.batch_size = batch_size
-        self.dataset_configs = dict()
-        self.num_workers = num_workers if num_workers is not None else batch_size * 2
-        self.use_worker_init_fn = use_worker_init_fn
-        if train is not None:
-            self.dataset_configs["train"] = train
-            self.train_dataloader = self._train_dataloader
-        if validation is not None:
-            self.dataset_configs["validation"] = validation
-            self.val_dataloader = partial(self._val_dataloader, shuffle=shuffle_val_dataloader)
-        if test is not None:
-            self.dataset_configs["test"] = test
-            self.test_dataloader = partial(self._test_dataloader, shuffle=shuffle_test_loader)
-        if predict is not None:
-            self.dataset_configs["predict"] = predict
-            self.predict_dataloader = self._predict_dataloader
-        self.wrap = wrap
-
-    def prepare_data(self):
-        # this call should only happen once, so we can quickly report
-        # some stats about the dataset that may be distributed as we
-        # instantiate (and presumably cache) them
-        print("#### Data #####")
-        for k in self.dataset_configs:
-            dataset = instantiate_from_config(self.dataset_configs[k])
-            print(f"{k}, {dataset.__class__.__name__}, {len(dataset)}")
-
-    def setup(self, stage=None):
-        self.datasets = dict(
-            (k, instantiate_from_config(self.dataset_configs[k]))
-            for k in self.dataset_configs)
-        if self.wrap:
-            for k in self.datasets:
-                self.datasets[k] = WrappedDataset(self.datasets[k])
-
-    def _train_dataloader(self):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
-        if is_iterable_dataset or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
-                          worker_init_fn=init_fn)
-
-    def _val_dataloader(self, shuffle=False):
-        if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(self.datasets["validation"],
-                          batch_size=self.batch_size,
-                          num_workers=self.num_workers,
-                          worker_init_fn=init_fn,
-                          shuffle=shuffle)
-
-    def _test_dataloader(self, shuffle=False):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
-        if is_iterable_dataset or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-
-        # do not shuffle dataloader for iterable dataset
-        shuffle = shuffle and (not is_iterable_dataset)
-
-        return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle)
-
-    def _predict_dataloader(self, shuffle=False):
-        if isinstance(self.datasets['predict'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(self.datasets["predict"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn)
 
 
 class SetupCallback(Callback):
@@ -534,64 +432,6 @@ if __name__ == "__main__":
     #           params:
     #               key: value
 
-    # Copy from one config path to another when the first is unset and the second exists.
-    CfgDefFrom: TypeAlias = tuple[Literal["default_from"], str, str]
-    # When the second path exists, always copy the value to the first path.
-    CfgSetFrom: TypeAlias = tuple[Literal["set_from"], str, str]
-    # Set a config path to a given value if it is unset; the value must exist.
-    CfgDefAs: TypeAlias = tuple[Literal["default_as"], str, Any]
-    # Always set a config path to a given value; the value must exist.
-    CfgSetAs: TypeAlias = tuple[Literal["set_as"], str, Any]
-    # Ensures a config path no longer exists.
-    CfgDrop: TypeAlias = tuple[Literal["drop"], str]
-    CfgOps: TypeAlias = Union[CfgDefFrom, CfgSetFrom, CfgDefAs, CfgSetAs]
-
-    def operate_on_config(config: DictConfig, *args: CfgOps):
-        """
-        Performs some common operations on an OmegaConf `DictConfig`.  These
-        are performed in the order given.  See the `CfgOps` type for operations
-        that can be performed.
-
-        The meaning of a value "existing" is its key must exist (when a path)
-        and/or the value must not be `None`.  This allows `kwargs` defaults
-        to work properly.
-        """
-
-        from omegaconf._utils import split_key
-
-        # A reference to use as a default, to detect actually missing keys.
-        NOT_EXISTS = {}
-
-        # Why does this dumb library not have a built-in for this?
-        def is_set(path: str):
-            return OmegaConf.select(config, path, default=NOT_EXISTS) is not NOT_EXISTS
-
-        def try_set(path: str, val: Any):
-            if val is None: return
-            OmegaConf.update(config, path, val)
-
-        for op in args:
-            if op[0] == "default_from":
-                if is_set(op[1]): continue
-                try_set(op[1], OmegaConf.select(config, op[2], default=None))
-            elif op[0] == "set_from":
-                try_set(op[1], OmegaConf.select(config, op[2], default=None))
-            elif op[0] == "default_as":
-                if is_set(op[1]): continue
-                try_set(op[1], op[2])
-            elif op[0] == "set_as":
-                try_set(op[1], op[2])
-            elif op[0] == "drop":
-                keys = split_key(op[1])
-                last_key = keys.pop()
-                keys = "[" + "][".join(keys) + "]"
-                sub_config = OmegaConf.select(config, keys, default=None)
-                if sub_config is None: continue
-                sub_config.pop(last_key, None)
-            else:
-                raise TypeError(f"Unknown config operation: {op}")
-        return config
-
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
     # add cwd for convenience and to make classes in this file available when
@@ -656,8 +496,6 @@ if __name__ == "__main__":
         cli = OmegaConf.from_dotlist(unknown)
         config = OmegaConf.merge(*configs, cli)
 
-        pp = "model.params.personalization_config.params"
-
         operate_on_config(config,
             # if given a seed from CLI, always use it
             ("set_as", "seed", opt.seed),
@@ -669,48 +507,23 @@ if __name__ == "__main__":
             ("drop", "lightning.trainer.resume_from_checkpoint"),
             # merge trainer cli with config
             *[("set_as", f"lightning.trainer[{k}]", getattr(opt, k)) for k in nondefault_trainer_args(opt)],
-            # apply custom cli for model
-            ("set_as", f"{pp}.embedding_manager_ckpt", opt.embedding_manager_ckpt),
-            ("set_as", f"{pp}.placeholder_strings", [opt.placeholder_string] if opt.placeholder_string else None),
-            ("default_as", f"{pp}.initializer_words", [opt.init_word] if opt.init_word else None),
-            ("set_as", f"{pp}.initializer_words[0]", opt.init_word),
         )
 
-        # normalize the data config
-        if OmegaConf.select(config, "data.params.train.target") is not None:
-            tp = "data.params.train.params"
-            operate_on_config(config,
-                ("default_from", f"{tp}.templates", f"{pp}.templates"),
-                ("default_from", f"{tp}.dual_templates", f"{pp}.dual_templates"),
-                ("set_from", f"{tp}.per_image_tokens", f"{pp}.per_image_tokens"),
-                ("set_as", f"{tp}.data_root", opt.data_root),
-            )
-
-        if OmegaConf.select(config, "data.params.validation.target") is not None:
-            vp = "data.params.validation.params"
-            operate_on_config(config,
-                ("default_from", f"{vp}.templates", f"{pp}.templates"),
-                ("default_from", f"{vp}.dual_templates", f"{pp}.dual_templates"),
-                ("set_from", f"{vp}.per_image_tokens", f"{pp}.per_image_tokens"),
-                ("set_as", f"{vp}.data_root", opt.data_root),
-            )
-
-        # drop the copies of the templates from the personalization config
-        operate_on_config(config,
-            ("drop", f"{pp}.templates"),
-            ("drop", f"{pp}.dual_templates"),
-        )
+        # the data module may also do some config tweaking
+        DataKlass = DATA_CONFIG.ctor(config)
+        if DataKlass is not None and hasmethod(DataKlass, "normalize_config"):
+            DataKlass.normalize_config(config, opt)
 
         seed_everything(OmegaConf.select(config, "seed"))
 
         lightning_config = config.pop("lightning", OmegaConf.create())
         trainer_opt = argparse.Namespace(**OmegaConf.select(lightning_config, "trainer", default={}))
 
+        # data
+        data = DATA_CONFIG.instantiate(config)
+
         # model
-        if opt.actual_resume:
-            model = load_model_from_config(config, opt.actual_resume)
-        else:
-            model = instantiate_from_config(config.model)
+        model = load_model_from_config(config, opt.actual_resume)
 
         # trainer and callbacks
         trainer_kwargs = dict()
@@ -790,7 +603,7 @@ if __name__ == "__main__":
                 }
             },
             "learning_rate_logger": {
-                "target": "main.LearningRateMonitor",
+                "target": "pytorch_lightning.callbacks.LearningRateMonitor",
                 "params": {
                     "logging_interval": "step",
                     # "log_momentum": True
@@ -837,9 +650,6 @@ if __name__ == "__main__":
         print("#### Trainer #####")
         print(f"Accelerator: {trainer.accelerator.__class__.__name__}")
         print(f"Strategy: {trainer.strategy.__class__.__name__}")
-
-        # data
-        data = instantiate_from_config(config.data)
 
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate

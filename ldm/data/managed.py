@@ -170,12 +170,14 @@ class ManagedBase(Dataset):
 class ManagedData(ImageDataWithMetadata):
     """An image with caption and used placeholders."""
     caption: str
+    human_caption: str
     placeholders: list[str]
 
 
 class ManagedStyle(ManagedBase):
     def __init__(self,
                  placeholder_token: str="*",
+                 placeholder_desc: Optional[str]=None,
                  templates: Optional[list[str]]=None,
                  default_conditions: Optional[list[str]]=None,
                  extra_conditions: Optional[list[str]]=None,
@@ -185,6 +187,7 @@ class ManagedStyle(ManagedBase):
         super().__init__(**kwargs)
 
         self.placeholder_token = placeholder_token
+        self.placeholder_desc = default(placeholder_desc, placeholder_token)
         self.default_conditions = default(default_conditions, style_conditions)
         self.extra_conditions = default(extra_conditions, [])
         self.base_templates = default(templates, style_templates)
@@ -216,6 +219,11 @@ class ManagedStyle(ManagedBase):
                 subject=self.placeholder_string,
                 quality=extra_placeholder
             )
+            human_caption = text.format(
+                condition=condition,
+                subject=f"[{self.placeholder_desc}]",
+                quality=f"[{quality_key}]"
+            )
         else:
             placeholders = [self.placeholder_string]
             text = random.choice(solo_templates)
@@ -223,8 +231,17 @@ class ManagedStyle(ManagedBase):
                 condition=condition,
                 subject=self.placeholder_string
             )
+            human_caption = text.format(
+                condition=condition,
+                subject=f"[{self.placeholder_desc}]"
+            )
 
-        return ManagedData(caption=caption, placeholders=placeholders, **src_data)
+        return ManagedData(
+            caption=caption,
+            human_caption=human_caption,
+            placeholders=placeholders,
+            **src_data
+        )
 
     @property
     def placeholder_string(self):
