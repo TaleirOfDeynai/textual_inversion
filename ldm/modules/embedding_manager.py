@@ -137,6 +137,9 @@ class EmbeddingManager(nn.Module):
     ):
         b, n, device = *tokenized_text.shape, tokenized_text.device
 
+        if self.progressive_words:
+            self.progressive_counter += 1
+
         for placeholder_string, placeholder_token in self.string_to_token_dict.items():
             max_vectors = self.subject_vectors if placeholder_string == self.subject_placeholder else self.quality_vectors
             placeholder_embedding: Tensor = self.string_to_param_dict[placeholder_string].to(device)
@@ -146,7 +149,6 @@ class EmbeddingManager(nn.Module):
                 embedded_text[placeholder_idx] = placeholder_embedding
             else: # otherwise, need to insert and keep track of changing indices
                 if self.progressive_words:
-                    self.progressive_counter += 1
                     max_step_tokens = 1 + self.progressive_counter // PROGRESSIVE_SCALE
                 else:
                     max_step_tokens = max_vectors
@@ -185,8 +187,8 @@ class EmbeddingManager(nn.Module):
     def load(self, ckpt_path):
         ckpt: dict = torch.load(ckpt_path, map_location="cpu")
 
-        # Newly added key; may not exist on the checkpoints.
-        self.progressive_counter = ckpt.get("progressive_counter", 0)
+        # Allows `progressive_words` mode to resume properly.
+        self.progressive_counter: int = ckpt.get("progressive_counter", 0)
 
         token_dict: dict[str, Tensor] = ckpt["string_to_token"]
         self.string_to_token_dict.update(token_dict)
