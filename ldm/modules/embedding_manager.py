@@ -179,6 +179,7 @@ class EmbeddingManager(nn.Module):
 
     def save(self, ckpt_path):
         save_obj = {
+            "subject_placeholder": self.subject_placeholder,
             "string_to_token": self.string_to_token_dict,
             "string_to_param": self.string_to_param_dict,
             "progressive_counter": self.progressive_counter
@@ -187,6 +188,12 @@ class EmbeddingManager(nn.Module):
 
     def load(self, ckpt_path):
         ckpt: dict = torch.load(ckpt_path, map_location="cpu")
+
+        # Primarily to allow other software to deal with multi-term embeddings.
+        # This is the embedding of the intentionally trained subject.
+        # All we can really do here is a config sanity check.
+        loaded_placeholder = ckpt.get("subject_placeholder", self.subject_placeholder)
+        assert loaded_placeholder == self.subject_placeholder, f"The subject placeholder changed from \"{loaded_placeholder}\" to \"{self.subject_placeholder}\" since the checkpoint was saved."
 
         # Allows `progressive_words` mode to resume properly.
         self.progressive_counter: int = ckpt.get("progressive_counter", 0)
