@@ -127,7 +127,7 @@ class EmbeddingManager(nn.Module):
             token = as_token(as_list(placeholder_string))
             init_token_params = self.initial_embeddings[placeholder_string]
             
-            self.string_to_token_dict[placeholder_string] = token
+            self.string_to_token_dict[placeholder_string] = token.detach()
             self.string_to_param_dict[placeholder_string] = nn.Parameter(init_token_params, requires_grad=True)
 
     def forward(
@@ -142,10 +142,11 @@ class EmbeddingManager(nn.Module):
 
         for placeholder_string, placeholder_token in self.string_to_token_dict.items():
             max_vectors = self.subject_vectors if placeholder_string == self.subject_placeholder else self.quality_vectors
-            placeholder_embedding: Tensor = self.string_to_param_dict[placeholder_string].to(device)
+            placeholder_token = placeholder_token.to(device)
+            placeholder_embedding = cast(Tensor, self.string_to_param_dict[placeholder_string]).to(device)
 
             if max_vectors == 1: # If there's only one vector per token, we can do a simple replacement
-                placeholder_idx = torch.where(tokenized_text == placeholder_token.to(device))
+                placeholder_idx = torch.where(tokenized_text == placeholder_token)
                 embedded_text[placeholder_idx] = placeholder_embedding
             else: # otherwise, need to insert and keep track of changing indices
                 if self.progressive_words:
@@ -156,7 +157,7 @@ class EmbeddingManager(nn.Module):
                 num_vectors_for_token = min(placeholder_embedding.shape[0], max_step_tokens)
                 shuffle_view = self.shuffle_embeddings(placeholder_embedding, num_vectors_for_token)
 
-                placeholder_rows, placeholder_cols = torch.where(tokenized_text == placeholder_token.to(device))
+                placeholder_rows, placeholder_cols = torch.where(tokenized_text == placeholder_token)
 
                 if placeholder_rows.nelement() == 0:
                     continue
@@ -168,7 +169,7 @@ class EmbeddingManager(nn.Module):
                     row = sorted_rows[idx]
                     col = sorted_cols[idx]
 
-                    new_token_row = torch.cat([tokenized_text[row][:col], placeholder_token.repeat(num_vectors_for_token).to(device), tokenized_text[row][col + 1:]], axis=0)[:n]
+                    new_token_row = torch.cat([tokenized_text[row][:col], tokenized_text[row][col].repeat(num_vectors_for_token), tokenized_text[row][col + 1:]], axis=0)[:n]
                     new_embed_row = torch.cat([embedded_text[row][:col], shuffle_view, embedded_text[row][col + 1:]], axis=0)[:n]
 
                     embedded_text[row]  = new_embed_row
