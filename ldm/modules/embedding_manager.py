@@ -1,31 +1,57 @@
+from typing import Union, Callable, Optional, cast
+
 import torch
 from torch import Tensor, nn
 
-from ldm.util import default
-from ldm.modules.embedding_shuffler import get_shuffler
+from ldm.util import default, as_list
+from ldm.modules.embedding_shuffler import ShuffleMode, get_shuffler
 from ldm.data.personalized import extra_token_list
-from transformers import CLIPTokenizer
 from functools import partial
 
 DEFAULT_PLACEHOLDER_TOKEN = ["*"]
 
 PROGRESSIVE_SCALE = 2000
 
-def get_clip_token_for_string(tokenizer, string):
-    batch_encoding = tokenizer(string, truncation=True, max_length=77, return_length=True,
-                               return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
-    tokens = batch_encoding["input_ids"]
-    assert torch.count_nonzero(tokens - 49407) == 2, f"String '{string}' maps to more than a single token. Please use another string"
+CLIP_ARGS = {
+    "truncation": True,
+    "max_length": 77,
+    "return_length": True,
+    "return_overflowing_tokens": False,
+    "padding": "max_length",
+    "return_tensors": "pt"
+}
 
-    return tokens[0, 1]
+InitWords = Union[list[str], str]
+WordsToTokenFn = Callable[[list[str]], Tensor]
+TokenToEmbFn = Callable[[Tensor], Tensor]
 
-def get_bert_token_for_string(tokenizer, string):
-    token = tokenizer(string)
-    assert torch.count_nonzero(token) == 3, f"String '{string}' maps to more than a single token. Please use another string"
 
-    token = token[0, 1]
+class TokenSizeError(ValueError):
+    """Indicates that no words mapped to a single token."""
+    def __init__(self, words: list[str]):
+        joined_words = ", ".join(words)
+        message = "\n".join([
+            f"All of the following string(s) map to more than one token: {joined_words}",
+            "Please try another string."
+        ])
+        super().__init__(message)
+        self.words = words
 
-    return token
+
+def get_clip_token_for_string(tokenizer, words: list[str]):
+    for word in words:
+        batch_encoding = tokenizer(word, **CLIP_ARGS)
+        tokens = batch_encoding["input_ids"]
+        if torch.count_nonzero(tokens - 49407) == 2: return tokens[0, 1]
+
+    raise TokenSizeError(words)
+
+def get_bert_token_for_string(tokenizer, words: list[str]):
+    for word in words:
+        token = tokenizer(word)
+        if torch.count_nonzero(token) == 3: return token[0, 1]
+
+    raise TokenSizeError(words)
 
 def get_embedding_for_clip_token(embedder, token):
     return embedder(token.unsqueeze(0))[0, 0]
@@ -35,72 +61,87 @@ class EmbeddingManager(nn.Module):
     def __init__(
             self,
             embedder,
-            placeholder_strings=None,
-            initializer_words=None,
-            shuffle_mode=None,
-            per_image_tokens=False,
-            num_vectors_per_token=1,
+            placeholder_strings: Optional[list[str]]=None,
+            initializer_words: Optional[list[InitWords]]=None,
+            shuffle_mode: Optional[Union[bool, ShuffleMode]]=None,
+            per_image_tokens: bool=False,
+            num_vectors_per_token: Optional[int]=None,
+            subject_vectors: Optional[int]=None,
+            quality_vectors: Optional[int]=None,
             progressive_words=False,
             **kwargs
     ):
         super().__init__()
 
-        self.string_to_token_dict = {}
-        
-        self.string_to_param_dict = nn.ParameterDict()
+        placeholder_strings = default(placeholder_strings, DEFAULT_PLACEHOLDER_TOKEN)
+        # Ensure it is illegal to pass an empty list.
+        assert len(placeholder_strings) > 0, "Need at least one placeholder string."
 
-        self.initial_embeddings = nn.ParameterDict() # These should not be optimized
+        extra_tokens = extra_token_list if per_image_tokens else []
+        placeholder_strings = placeholder_strings + extra_tokens
 
+        initializer_words = default(initializer_words, [])
+
+        # `num_vectors_per_token` is for backward compatibility only.
+        assert num_vectors_per_token is None or subject_vectors is None, "Cannot use `num_vectors_per_token` with `subject_vectors`."
+        assert num_vectors_per_token is None or quality_vectors is None, "Cannot use `num_vectors_per_token` with `quality_vectors`."
+
+        num_vectors_per_token = default(num_vectors_per_token, 1)
+        self.subject_vectors = default(subject_vectors, num_vectors_per_token)
+        self.quality_vectors = default(quality_vectors, self.subject_vectors)
+
+        # The first placeholder is assumed to represent the subject.
+        self.subject_placeholder = placeholder_strings[0]
         self.shuffle_embeddings = get_shuffler(default(shuffle_mode, "off"))
         self.progressive_words = progressive_words
         self.progressive_counter = 0
 
-        self.max_vectors_per_token = num_vectors_per_token
-
-        if hasattr(embedder, 'tokenizer'): # using Stable Diffusion's CLIP encoder
-            self.is_clip = True
-            get_token_for_string = partial(get_clip_token_for_string, embedder.tokenizer)
-            get_embedding_for_tkn = partial(get_embedding_for_clip_token, embedder.transformer.text_model.embeddings)
+        if hasattr(embedder, "tokenizer"): # using Stable Diffusion's CLIP encoder
+            as_token = cast(WordsToTokenFn, partial(get_clip_token_for_string, embedder.tokenizer))
+            as_embedding = cast(TokenToEmbFn, partial(get_embedding_for_clip_token, embedder.transformer.text_model.embeddings))
             token_dim = 768
         else: # using LDM's BERT encoder
-            self.is_clip = False
-            get_token_for_string = partial(get_bert_token_for_string, embedder.tknz_fn)
-            get_embedding_for_tkn = embedder.transformer.token_emb
+            as_token = cast(WordsToTokenFn, partial(get_bert_token_for_string, embedder.tknz_fn))
+            as_embedding = cast(TokenToEmbFn, embedder.transformer.token_emb)
             token_dim = 1280
 
-        if per_image_tokens:
-            placeholder_strings.extend(extra_token_list)
-
+        # Initialize the initial embeddings; they should not be optimized.
+        self.initial_embeddings = nn.ParameterDict()
         for idx, placeholder_string in enumerate(placeholder_strings):
-            
-            token = get_token_for_string(placeholder_string)
-
-            if initializer_words and idx < len(initializer_words):
-                init_word_token = get_token_for_string(initializer_words[idx])
-
+            num_vectors = self.subject_vectors if placeholder_string == self.subject_placeholder else self.quality_vectors
+            init_words = as_list(initializer_words[idx]) if idx < len(initializer_words) else []
+            if len(init_words) > 0:
+                init_word_token = as_token(init_words)
                 with torch.no_grad():
-                    init_word_embedding = get_embedding_for_tkn(init_word_token.cpu())
+                    init_word_embedding = as_embedding(init_word_token.cpu())
 
-                token_params = torch.nn.Parameter(init_word_embedding.unsqueeze(0).repeat(num_vectors_per_token, 1), requires_grad=True)
-                self.initial_embeddings[placeholder_string] = torch.nn.Parameter(init_word_embedding.unsqueeze(0).repeat(num_vectors_per_token, 1), requires_grad=False)
+                self.initial_embeddings[placeholder_string] = nn.Parameter(init_word_embedding.unsqueeze(0).repeat(num_vectors, 1), requires_grad=False)
             else:
-                token_params = torch.nn.Parameter(torch.rand(size=(num_vectors_per_token, token_dim), requires_grad=True))
+                # Fallback to a random start.
+                self.initial_embeddings[placeholder_string] = nn.Parameter(torch.rand(size=(num_vectors, token_dim), requires_grad=False))
+
+        # Initialize the optimized embeddings.
+        self.string_to_token_dict: dict[str, Tensor] = {}
+        self.string_to_param_dict = nn.ParameterDict()
+        for placeholder_string in placeholder_strings:
+            token = as_token(as_list(placeholder_string))
+            init_token_params = self.initial_embeddings[placeholder_string]
             
             self.string_to_token_dict[placeholder_string] = token
-            self.string_to_param_dict[placeholder_string] = token_params
+            self.string_to_param_dict[placeholder_string] = nn.Parameter(init_token_params, requires_grad=True)
 
     def forward(
             self,
-            tokenized_text,
-            embedded_text,
+            tokenized_text: Tensor,
+            embedded_text: Tensor,
     ):
         b, n, device = *tokenized_text.shape, tokenized_text.device
 
         for placeholder_string, placeholder_token in self.string_to_token_dict.items():
+            max_vectors = self.subject_vectors if placeholder_string == self.subject_placeholder else self.quality_vectors
+            placeholder_embedding: Tensor = self.string_to_param_dict[placeholder_string].to(device)
 
-            placeholder_embedding = self.string_to_param_dict[placeholder_string].to(device)
-
-            if self.max_vectors_per_token == 1: # If there's only one vector per token, we can do a simple replacement
+            if max_vectors == 1: # If there's only one vector per token, we can do a simple replacement
                 placeholder_idx = torch.where(tokenized_text == placeholder_token.to(device))
                 embedded_text[placeholder_idx] = placeholder_embedding
             else: # otherwise, need to insert and keep track of changing indices
@@ -108,7 +149,7 @@ class EmbeddingManager(nn.Module):
                     self.progressive_counter += 1
                     max_step_tokens = 1 + self.progressive_counter // PROGRESSIVE_SCALE
                 else:
-                    max_step_tokens = self.max_vectors_per_token
+                    max_step_tokens = max_vectors
 
                 num_vectors_for_token = min(placeholder_embedding.shape[0], max_step_tokens)
                 shuffle_view = self.shuffle_embeddings(placeholder_embedding, num_vectors_for_token)
@@ -134,14 +175,59 @@ class EmbeddingManager(nn.Module):
         return embedded_text
 
     def save(self, ckpt_path):
-        torch.save({"string_to_token": self.string_to_token_dict,
-                    "string_to_param": self.string_to_param_dict}, ckpt_path)
+        save_obj = {
+            "string_to_token": self.string_to_token_dict,
+            "string_to_param": self.string_to_param_dict,
+            "progressive_counter": self.progressive_counter
+        }
+        torch.save(save_obj, ckpt_path)
 
     def load(self, ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location='cpu')
+        ckpt: dict = torch.load(ckpt_path, map_location="cpu")
 
-        self.string_to_token_dict = ckpt["string_to_token"]
-        self.string_to_param_dict = ckpt["string_to_param"]
+        # Newly added key; may not exist on the checkpoints.
+        self.progressive_counter = ckpt.get("progressive_counter", 0)
+
+        token_dict: dict[str, Tensor] = ckpt["string_to_token"]
+        self.string_to_token_dict.update(token_dict)
+        
+        param_dict: dict[str, Tensor] = ckpt["string_to_param"]
+        self.string_to_param_dict.update(param_dict)
+
+        self.resize_after_load()
+
+    def resize_after_load(self):
+        """
+        Checks to see if the loaded parameters need to have their size adjusted
+        and does so as needed.
+
+        It is possible the configuration was altered and the number of vectors
+        has changed.  This could cause `embedding_to_coarse_loss` to throw errors
+        when doing its subtraction.
+        """
+        for placeholder_string, in_param in self.string_to_param_dict.items():
+            max_vectors = self.subject_vectors if placeholder_string == self.subject_placeholder else self.quality_vectors
+            placeholder_embedding: Tensor = in_param
+            loaded_size = placeholder_embedding.shape[0]
+            
+            # Same size, all good.
+            if loaded_size == max_vectors:
+                continue
+            # Loaded is smaller, overlay on top of the initial embedding.
+            if loaded_size < max_vectors:
+                with torch.no_grad():
+                    init_embedding: Tensor = self.initial_embeddings[placeholder_string]
+                    to_add = max_vectors - loaded_size
+                    resized = torch.cat([placeholder_embedding, init_embedding[-to_add:]], 0)
+                self.string_to_param_dict[placeholder_string] = nn.Parameter(resized, requires_grad=True)
+                print(f"Expanded `{placeholder_string}` from {loaded_size} to {resized.shape[0]} vectors.")
+            # Loaded is larger, truncate the additional vectors.
+            if loaded_size > max_vectors:
+                with torch.no_grad():
+                    to_remove = loaded_size - max_vectors
+                    resized = placeholder_embedding[:-to_remove]
+                self.string_to_param_dict[placeholder_string] = nn.Parameter(resized, requires_grad=True)
+                print(f"Contracted `{placeholder_string}` from {loaded_size} to {resized.shape[0]} vectors.")
 
     def get_embedding_norms_squared(self):
         all_params = torch.cat(list(self.string_to_param_dict.values()), axis=0) # num_placeholders x embedding_dim

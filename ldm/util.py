@@ -43,14 +43,12 @@ def log_txt_as_img(wh, xc, size=10):
 
 
 def ismap(x):
-    if not isinstance(x, torch.Tensor):
-        return False
+    if not isinstance(x, torch.Tensor): return False
     return (len(x.shape) == 4) and (x.shape[1] > 3)
 
 
 def isimage(x):
-    if not isinstance(x, torch.Tensor):
-        return False
+    if not isinstance(x, torch.Tensor): return False
     return (len(x.shape) == 4) and (x.shape[1] == 3 or x.shape[1] == 1)
 
 
@@ -59,9 +57,13 @@ def exists(x: Optional[T]) -> TypeGuard[T]:
 
 
 def default(val: Optional[T], d: Union[T, Callable[[], T]]) -> T:
-    if exists(val):
-        return val
+    if exists(val): return val
     return d() if isfunction(d) else d
+
+
+def as_list(val: Union[list[T], T]) -> list[T]:
+    if isinstance(val, list): return val
+    return [val]
 
 
 def mean_flat(tensor):
