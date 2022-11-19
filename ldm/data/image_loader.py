@@ -53,6 +53,8 @@ def get_images_in(data_root: str,
             images.append(ImageSrc(path=img_path, image=img))
         except UnidentifiedImageError:
             continue
+        except IsADirectoryError:
+            continue
     return images
 
 
