@@ -6,6 +6,7 @@ https://github.com/CompVis/taming-transformers
 -- merci
 """
 
+from typing import Dict, Optional, Tuple, TypeGuard, Union
 import torch
 
 import torch.nn as nn
@@ -19,18 +20,27 @@ from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities.distributed import rank_zero_only
+from ldm.modules.encoders.modules import AbstractEncoder
+from adabelief_pytorch import AdaBelief
 
-from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
+from ldm.util import log_txt_as_img, exists, hasmethod, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
 from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.modules.embedding_manager import EmbeddingManager
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
                          'adm': 'y'}
+
+
+MaybeEncoding = Union[nn.Module, AbstractEncoder]
+
+def is_encoding_module(val: MaybeEncoding) -> TypeGuard[AbstractEncoder]:
+    return hasmethod(val, "encode")
 
 
 def disabled_train(self, mode=True):
@@ -343,7 +353,7 @@ class DDPM(pl.LightningModule):
         x = x.to(memory_format=torch.contiguous_format).float()
         return x
 
-    def shared_step(self, batch):
+    def shared_step(self, batch) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         x = self.get_input(batch, self.first_stage_key)
         loss, loss_dict = self(x)
         return loss, loss_dict
@@ -354,8 +364,12 @@ class DDPM(pl.LightningModule):
         self.log("global_step", torch.tensor(self.global_step, dtype=torch.float32),
                  prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
-        self.log_dict(loss_dict, prog_bar=True,
-                      logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        # Log these to the progress bar.
+        sim_emb = loss_dict.pop("train/emb_sim_avg")
+        self.log("train/emb_sim_avg", sim_emb, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+
+        # Log everything else to the logger directly.
+        self.log_dict(loss_dict, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
 
         if self.use_scheduler:
             lr = self.optimizers().param_groups[0]['lr']
@@ -426,7 +440,7 @@ class DDPM(pl.LightningModule):
         params = list(self.model.parameters())
         if self.learn_logvar:
             params = params + [self.logvar]
-        opt = torch.optim.AdamW(params, lr=lr)
+        opt = AdaBelief(params, lr=lr)
         return opt
 
 
@@ -531,7 +545,7 @@ class LatentDiffusion(DDPM):
             self.make_cond_schedule()
 
     def instantiate_first_stage(self, config):
-        model = instantiate_from_config(config)
+        model: pl.LightningModule = instantiate_from_config(config)
         self.first_stage_model = model.eval()
         self.first_stage_model.train = disabled_train
         for param in self.first_stage_model.parameters():
@@ -547,7 +561,7 @@ class LatentDiffusion(DDPM):
                 self.cond_stage_model = None
                 # self.be_unconditional = True
             else:
-                model = instantiate_from_config(config)
+                model: MaybeEncoding = instantiate_from_config(config)
                 self.cond_stage_model = model.eval()
                 self.cond_stage_model.train = disabled_train
                 for param in self.cond_stage_model.parameters():
@@ -555,12 +569,12 @@ class LatentDiffusion(DDPM):
         else:
             assert config != '__is_first_stage__'
             assert config != '__is_unconditional__'
-            model = instantiate_from_config(config)
+            model: MaybeEncoding = instantiate_from_config(config)
             self.cond_stage_model = model
             
     
     def instantiate_embedding_manager(self, config, embedder):
-        model = instantiate_from_config(config, embedder=embedder)
+        model: EmbeddingManager = instantiate_from_config(config, embedder=embedder)
 
         if config.params.get("embedding_manager_ckpt", None): # do not load if missing OR empty string
             model.load(config.params.embedding_manager_ckpt)
@@ -588,9 +602,10 @@ class LatentDiffusion(DDPM):
             raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
         return self.scale_factor * z
 
-    def get_learned_conditioning(self, c):
+    def get_learned_conditioning(self, c: torch.Tensor):
+        assert self.cond_stage_model is not None
         if self.cond_stage_forward is None:
-            if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
+            if is_encoding_module(self.cond_stage_model):
                 c = self.cond_stage_model.encode(c, embedding_manager=self.embedding_manager)
                 if isinstance(c, DiagonalGaussianDistribution):
                     c = c.mode()
@@ -1055,7 +1070,7 @@ class LatentDiffusion(DDPM):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_output = self.apply_model(x_noisy, t, cond)
 
-        loss_dict = {}
+        loss_dict: dict[str, torch.Tensor] = {}
         prefix = 'train' if self.training else 'val'
 
         if self.parameterization == "x0":
@@ -1084,12 +1099,19 @@ class LatentDiffusion(DDPM):
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
 
+        emb_dist, emb_dist_dict = self.embedding_manager.embedding_to_distance()
+        loss_dict.update({f'{prefix}/emb_dist_total': emb_dist})
+        loss_dict.update({f'{prefix}/{k}': v for k, v in emb_dist_dict.items()})
+
+        emb_sim, emb_sim_dict = self.embedding_manager.embedding_to_similarity()
+        loss_dict.update({f'{prefix}/emb_sim_avg': emb_sim})
+        loss_dict.update({f'{prefix}/{k}': v for k, v in emb_sim_dict.items()})
+
         if self.embedding_reg_weight > 0:
-            loss_embedding_reg = self.embedding_manager.embedding_to_coarse_loss().mean()
+            emb_loss = self.embedding_manager.embedding_to_coarse_loss().mean()
+            loss_dict.update({f'{prefix}/loss_emb_reg': emb_loss})
 
-            loss_dict.update({f'{prefix}/loss_emb_reg': loss_embedding_reg})
-
-            loss += (self.embedding_reg_weight * loss_embedding_reg)
+            loss += (self.embedding_reg_weight * emb_loss)
             loss_dict.update({f'{prefix}/loss': loss})
 
         return loss, loss_dict
@@ -1365,7 +1387,7 @@ class LatentDiffusion(DDPM):
                                                ddim=use_ddim, 
                                                ddim_steps=ddim_steps,
                                                eta=ddim_eta,                                                 
-                                               unconditional_guidance_scale=5.0,
+                                               unconditional_guidance_scale=10.0,
                                                unconditional_conditioning=uc)
             log["samples_scaled"] = self.decode_first_stage(sample_scaled)
 
@@ -1426,9 +1448,9 @@ class LatentDiffusion(DDPM):
 
             if self.unfreeze_model: # Are we allowing the base model to train? If so, set two different parameter groups.
                 model_params = list(self.cond_stage_model.parameters()) + list(self.model.parameters())
-                opt = torch.optim.AdamW([{"params": embedding_params, "lr": lr}, {"params": model_params}], lr=self.model_lr)
+                opt = AdaBelief([{"params": embedding_params, "lr": lr}, {"params": model_params}], lr=self.model_lr)
             else: # Otherwise, train only embedding
-                opt = torch.optim.AdamW(embedding_params, lr=lr)
+                opt = AdaBelief(embedding_params, lr=lr)
         else:
             params = list(self.model.parameters())
             if self.cond_stage_trainable:
@@ -1438,7 +1460,7 @@ class LatentDiffusion(DDPM):
                 print('Diffusion model optimizing logvar')
                 params.append(self.logvar)
 
-                opt = torch.optim.AdamW(params, lr=lr)
+                opt = AdaBelief(params, lr=lr)
 
         return opt
 
@@ -1459,7 +1481,7 @@ class LatentDiffusion(DDPM):
 
         lr = self.learning_rate
         params = list(self.embedding_manager.embedding_parameters())
-        return torch.optim.AdamW(params, lr=lr)
+        return AdaBelief(params, lr=lr)
 
     def configure_opt_model(self):
 
@@ -1474,7 +1496,7 @@ class LatentDiffusion(DDPM):
 
         model_params = list(self.cond_stage_model.parameters()) + list(self.model.parameters())
         embedding_params = list(self.embedding_manager.embedding_parameters())
-        return torch.optim.AdamW([{"params": embedding_params, "lr": self.learning_rate}, {"params": model_params}], lr=self.model_lr)
+        return AdaBelief([{"params": embedding_params, "lr": self.learning_rate}, {"params": model_params}], lr=self.model_lr)
 
     @torch.no_grad()
     def to_rgb(self, x):

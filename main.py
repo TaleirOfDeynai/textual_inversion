@@ -678,6 +678,9 @@ if __name__ == "__main__":
             print("++++ NOT USING LR SCALING ++++")
             print(f"Setting learning rate to {model.learning_rate:.2e}")
 
+        # Setup for tensor cores.
+        torch.set_float32_matmul_precision("medium")
+
         # Debug with USR2.
         def divein(*args, **kwargs):
             if trainer.global_rank == 0:

@@ -34,7 +34,7 @@ class AbstractEncoder(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def encode(self, *args, **kwargs):
+    def encode(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError
 
 

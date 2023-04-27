@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import os
 import random
 import itertools
+import re
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import Dataset
@@ -17,71 +18,24 @@ from ldm.util import default, partition, compact_dict, exists
 subject_conditions = [
     'a rendition',
     'a depiction',
-    'a photo',
-    'the photo',
+    '[a|the] photo',
+    'a [cropped|close-up|bright|dark|cropped|good] photo',
     'a rendering',
-    'a cropped photo',
-    'a close-up photo',
-    'a bright photo',
-    'a dark photo',
-    'a cropped photo',
-    'a good photo',
     'an illustration',
 ]
 
 subject_templates = [
-    '{condition} of a {subject}',
-    '{condition} of the {subject}',
-    '{condition} of my {subject}',
-    '{condition} of one {subject}',
-    '{condition} of a {subject} with {quality}',
-    '{condition} of the {subject} with {quality}',
-    '{condition} of my {subject} with {quality}',
-    '{condition} of one {subject} with {quality}',
-    '{condition} of a clean {subject}',
-    '{condition} of the clean {subject}',
-    '{condition} of a clean {subject} with {quality}',
-    '{condition} of the clean {subject} with {quality}',
-    '{condition} of a dirty {subject}',
-    '{condition} of the dirty {subject}',
-    '{condition} of a dirty {subject} with {quality}',
-    '{condition} of the dirty {subject} with {quality}',
-    '{condition} of a cool {subject}',
-    '{condition} of the cool {subject}',
-    '{condition} of a cool {subject} with {quality}',
-    '{condition} of the cool {subject} with {quality}',
-    '{condition} of a nice {subject}',
-    '{condition} of the nice {subject}',
-    '{condition} of a nice {subject} with {quality}',
-    '{condition} of the nice {subject} with {quality}',
-    '{condition} of a weird {subject}',
-    '{condition} of the weird {subject}',
-    '{condition} of a weird {subject} with {quality}',
-    '{condition} of the weird {subject} with {quality}',
-    '{condition} of a small {subject}',
-    '{condition} of the small {subject}',
-    '{condition} of a small {subject} with {quality}',
-    '{condition} of the small {subject} with {quality}',
-    '{condition} of a large {subject}',
-    '{condition} of the large {subject}',
-    '{condition} of a large {subject} with {quality}',
-    '{condition} of the large {subject} with {quality}',
+    '{condition} of [a|the|my|one] {subject}',
+    '{condition} of [a|the|my|one] {subject} with {quality}',
+    '{condition} of [a|the] [clean|dirty|cool|nice|weird|small|large] {subject}',
+    '{condition} of [a|the] [clean|dirty|cool|nice|weird|small|large] {subject} with {quality}',
 ]
 
 style_conditions = [
-    'a painting',
     'a picture',
     'a rendering',
-    'a cropped painting',
-    'a close-up painting',
-    'a bright painting',
-    'a dark painting',
-    'a cropped painting',
-    'a good painting',
-    'a nice painting',
-    'a small painting',
-    'a large painting',
-    'a weird painting',
+    'a painting',
+    'a [cropped|close-up|bright|dark|good|nice|small|large|weird] painting',
 ]
 
 style_templates = [
@@ -93,9 +47,11 @@ style_templates = [
 @dataclass
 class MetadataConf:
     """Per-file metadata for each image."""
+    enabled: bool = True
     conditions: list[str] = field(default_factory=list)
     qualities: list[str] = field(default_factory=list)
     templates: list[str] = field(default_factory=list)
+    overrides: list[str] = field(default_factory=list)
 
 
 class ImageSrcWithMetadata(di.ImageSrc):
@@ -124,8 +80,11 @@ class ImageLoaderWithMetadata(di.ImageLoader):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # Load the per-image metadata.
-        self.images = list(map(load_image_metadata, self.images))
+        # Load the per-image metadata, filtering out any disabled images.
+        self.images = list(filter(
+            lambda img: img["metadata"].enabled,
+            map(load_image_metadata, self.images)
+        ))
     
     def __getitem__(self, i):
         src_data = super().__getitem__(i)
@@ -140,8 +99,24 @@ def get_quality_tokens(qualities: list[str]):
         result[v] = dc.extra_token_list[i]
     return result
 
+def is_conditional_template(template: str):
+    return "{condition}" in template
+
 def is_dual_template(template: str):
     return "{quality}" in template
+
+def is_subjective_template(template: str):
+    return "{subject}" in template
+
+def do_replacement(match: re.Match[str]):
+    return random.choice(match.group(1).split("|"))
+
+def process_string_replacers(template: str):
+    """
+    Replaces substrings with the pattern `[str1|str2|str3]` with a random choice
+    of `str1` or `str2` or so on.
+    """
+    return re.sub(r"\[((?:\|?[^\]|]*)+?)\]", do_replacement, template)
 
 def pick_quality(qualities: list[str], mixing_prob: float, solo_count: int, dual_count: int):
     if dual_count == 0:
@@ -224,10 +199,14 @@ class ManagedStyle(ManagedBase):
         metadata = src_data["metadata"]
 
         base_conditions = metadata.conditions if len(metadata.conditions) > 0 else self.default_conditions
-        all_conditions = list(set(base_conditions + self.extra_conditions))
-        condition = random.choice(all_conditions)
+        extra_conditions = [] if "conditions" in metadata.overrides else self.extra_conditions
+        all_conditions = list(set(base_conditions + extra_conditions))
+        assert len(all_conditions) > 0, f"At least one condition is required for: {src_data['path']}"
 
-        all_templates = set(self.base_templates + metadata.templates)
+        base_templates = [] if "templates" in metadata.overrides else self.base_templates
+        all_templates = list(set(base_templates + metadata.templates))
+        assert len(all_templates) > 0, f"At least one template is required for: {src_data['path']}"
+
         parted_templates = partition(all_templates, is_dual_template)
         solo_templates = list(parted_templates[0])
         dual_templates = list(parted_templates[1])
@@ -238,10 +217,13 @@ class ManagedStyle(ManagedBase):
         # This also handles some assertions.  If this is not `None`,
         # it is safe to use `dual_templates`.
         quality_key = pick_quality(metadata.qualities, mixing_prob, len(solo_templates), len(dual_templates))
+        condition = process_string_replacers(random.choice(all_conditions))
 
         if quality_key is not None:
             extra_placeholder = self.quality_to_placeholder[quality_key]
-            text = random.choice(dual_templates)
+            text = process_string_replacers(random.choice(dual_templates))
+            assert is_subjective_template(text), f"Expected a subject placeholder in: {text}"
+
             caption = text.format(
                 condition=condition,
                 subject=self.placeholder_token,
@@ -253,7 +235,9 @@ class ManagedStyle(ManagedBase):
                 quality=f"[{quality_key}]"
             )
         else:
-            text = random.choice(solo_templates)
+            text = process_string_replacers(random.choice(solo_templates))
+            assert is_subjective_template(text), f"Expected a subject placeholder in: {text}"
+
             caption = text.format(
                 condition=condition,
                 subject=self.placeholder_token,

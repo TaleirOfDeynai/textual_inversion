@@ -92,6 +92,7 @@ class EmbeddingManager(nn.Module):
 
         # The first placeholder is assumed to represent the subject.
         self.subject_placeholder = placeholder_strings[0]
+        self.string_to_word_dict = { key: as_list(initializer_words[idx])[0] for idx, key in enumerate(placeholder_strings) }
         self.shuffle_embeddings = get_shuffler(default(shuffle_mode, "off"))
         self.progressive_words = progressive_words
         self.progressive_counter = 0
@@ -181,7 +182,7 @@ class EmbeddingManager(nn.Module):
         save_obj = {
             "subject_placeholder": self.subject_placeholder,
             "string_to_token": self.string_to_token_dict,
-            "string_to_param": self.string_to_param_dict,
+            "string_to_param": { k:v for k,v in self.string_to_param_dict.items() },
             "progressive_counter": self.progressive_counter
         }
         torch.save(save_obj, ckpt_path)
@@ -249,13 +250,57 @@ class EmbeddingManager(nn.Module):
         return self.string_to_param_dict.parameters()
 
     def embedding_to_coarse_loss(self):
-        loss = torch.zeros(1, requires_grad=True)
-        num_embeddings = len(self.initial_embeddings)
+        loss = torch.zeros(len(self.initial_embeddings))
 
-        for key in self.initial_embeddings:
-            optimized = self.string_to_param_dict[key]
-            coarse = self.initial_embeddings[key].clone().to(optimized.device)
+        for i, key in enumerate(self.initial_embeddings.keys()):
+            optimized = cast(Tensor, self.string_to_param_dict[key])
+            coarse = cast(Tensor, self.initial_embeddings[key]).to(optimized.device)
 
-            loss = loss + (optimized - coarse) @ (optimized - coarse).T / num_embeddings
+            loss = loss.to(optimized.device)
+            loss[i] = (optimized - coarse) @ (optimized - coarse).T
 
         return loss
+
+    @torch.no_grad()
+    def embedding_to_distance(self):
+        """
+        The embedding's distance is a tell of how much an embedding has
+        drifted from the embedding of its initialization word.
+        """
+        dist_acc = torch.zeros(len(self.initial_embeddings))
+        dist_dict: dict[str, Tensor] = {}
+
+        for i, key in enumerate(self.initial_embeddings.keys()):
+            word = self.string_to_word_dict[key]
+            optimized = cast(Tensor, self.string_to_param_dict[key])
+            coarse = cast(Tensor, self.initial_embeddings[key]).to(optimized.device)
+            dist = (optimized - coarse).pow(2).sum(-1).sqrt().sum()
+
+            dist_dict[f"emb_dist[{word}]"] = dist
+            dist_acc = dist_acc.to(optimized.device)
+            dist_acc[i] = dist
+
+        return dist_acc.sum(), dist_dict
+
+    @torch.no_grad()
+    def embedding_to_similarity(self):
+        """
+        The embedding's cosign similarity to the embedding of its
+        initialization word.
+        """
+        sim_acc = torch.zeros(len(self.initial_embeddings))
+        sim_dict: dict[str, Tensor] = {}
+
+        sim_fn = nn.CosineSimilarity(dim=0)
+
+        for i, key in enumerate(self.initial_embeddings.keys()):
+            word = self.string_to_word_dict[key]
+            optimized = cast(Tensor, self.string_to_param_dict[key])
+            coarse = cast(Tensor, self.initial_embeddings[key]).to(optimized.device)
+            sim = sim_fn(torch.flatten(optimized), torch.flatten(coarse))
+
+            sim_dict[f"emb_sim[{word}]"] = sim
+            sim_acc = sim_acc.to(optimized.device)
+            sim_acc[i] = sim
+
+        return sim_acc.mean(), sim_dict
